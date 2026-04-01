@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 use async_graphql::{Schema, EmptySubscription};
 use crate::core::{VectorClock, LWWMap};
 use crate::storage::{Storage, error::StorageError, OpenOptions};
-use crate::graphql::{QueryRoot, MutationRoot};
+use crate::graphql::{QueryRoot, MutationRoot, EventBus, Event, EventType};
 use serde::{Serialize, Deserialize};
 
 pub struct Database<S: Storage + 'static> {
@@ -14,6 +14,7 @@ pub struct Database<S: Storage + 'static> {
     pub(crate) clock: Arc<RwLock<VectorClock>>,
     relations: Arc<RwLock<HashMap<String, RelationConfig>>>,
     base_path: String,
+    event_bus: EventBus,
 }
 
 pub(crate) struct Collection {
@@ -53,6 +54,7 @@ pub(crate) struct GraphqlDatabase {
     pub node_id: String,
     pub storage: Arc<dyn Storage>,
     pub base_path: String,
+    pub event_bus: EventBus,
 }
 
 impl GraphqlDatabase {
@@ -99,10 +101,17 @@ impl GraphqlDatabase {
             },
         };
         
-        col.data.insert(id, record.clone());
+        col.data.insert(id.clone(), record.clone());
         drop(collections);
         
         self.save_collection(collection).await?;
+        
+        let _ = self.event_bus.publish(Event {
+            event_type: EventType::Created,
+            collection: collection.to_string(),
+            record_id: id,
+            data: Some(record.fields.clone()),
+        });
         
         Ok(record)
     }
@@ -120,6 +129,13 @@ impl GraphqlDatabase {
                 
                 self.save_collection(collection).await?;
                 
+                let _ = self.event_bus.publish(Event {
+                    event_type: EventType::Updated,
+                    collection: collection.to_string(),
+                    record_id: id.to_string(),
+                    data: Some(record.fields.clone()),
+                });
+                
                 Ok(Some(record))
             } else {
                 Ok(None)
@@ -136,6 +152,13 @@ impl GraphqlDatabase {
             drop(collections);
             
             self.save_collection(collection).await?;
+            
+            let _ = self.event_bus.publish(Event {
+                event_type: EventType::Deleted,
+                collection: collection.to_string(),
+                record_id: id.to_string(),
+                data: None,
+            });
             
             Ok(true)
         } else {
@@ -194,6 +217,7 @@ impl<S: Storage + 'static> Database<S> {
             clock: Arc::new(RwLock::new(VectorClock::new())),
             relations: Arc::new(RwLock::new(HashMap::new())),
             base_path,
+            event_bus: EventBus::new(),
         };
         
         db.load_all().await?;
@@ -250,6 +274,7 @@ impl<S: Storage + 'static> Database<S> {
             node_id: self.node_id.clone(),
             storage: self.storage.clone(),
             base_path: self.base_path.clone(),
+            event_bus: self.event_bus.clone(),
         }
     }
 

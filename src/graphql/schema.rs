@@ -225,8 +225,25 @@ impl SubscriptionRoot {
         ctx: &Context<'_>,
         collection: String
     ) -> impl Stream<Item = Record> {
-        let _ = (ctx, collection);
-        stream::iter(vec![])
+        let db = ctx.data::<crate::api::database::GraphqlDatabase>().unwrap();
+        let mut rx = db.event_bus.subscribe();
+        
+        async_stream::stream! {
+            while let Ok(event) = rx.recv().await {
+                if event.collection == collection && matches!(event.event_type, super::event::EventType::Created) {
+                    if let Some(data) = event.data {
+                        yield Record {
+                            data,
+                            meta: Meta {
+                                id: event.record_id.into(),
+                                created_at: DateTime(chrono::Utc::now()),
+                                updated_at: DateTime(chrono::Utc::now()),
+                            },
+                        };
+                    }
+                }
+            }
+        }
     }
 
     async fn record_updated(
@@ -234,8 +251,25 @@ impl SubscriptionRoot {
         ctx: &Context<'_>,
         collection: String
     ) -> impl Stream<Item = Record> {
-        let _ = (ctx, collection);
-        stream::iter(vec![])
+        let db = ctx.data::<crate::api::database::GraphqlDatabase>().unwrap();
+        let mut rx = db.event_bus.subscribe();
+        
+        async_stream::stream! {
+            while let Ok(event) = rx.recv().await {
+                if event.collection == collection && matches!(event.event_type, super::event::EventType::Updated) {
+                    if let Some(data) = event.data {
+                        yield Record {
+                            data,
+                            meta: Meta {
+                                id: event.record_id.into(),
+                                created_at: DateTime(chrono::Utc::now()),
+                                updated_at: DateTime(chrono::Utc::now()),
+                            },
+                        };
+                    }
+                }
+            }
+        }
     }
 
     async fn record_deleted(
@@ -243,7 +277,15 @@ impl SubscriptionRoot {
         ctx: &Context<'_>,
         collection: String
     ) -> impl Stream<Item = ID> {
-        let _ = (ctx, collection);
-        stream::iter(vec![])
+        let db = ctx.data::<crate::api::database::GraphqlDatabase>().unwrap();
+        let mut rx = db.event_bus.subscribe();
+        
+        async_stream::stream! {
+            while let Ok(event) = rx.recv().await {
+                if event.collection == collection && matches!(event.event_type, super::event::EventType::Deleted) {
+                    yield event.record_id.into();
+                }
+            }
+        }
     }
 }
