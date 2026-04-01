@@ -18,7 +18,7 @@ pub struct RelationConfig {
     pub local_key: String,
 }
 
-impl<S: Storage> DatabaseBuilder<S> {
+impl<S: Storage + 'static> DatabaseBuilder<S> {
     pub fn new(storage: S) -> Self {
         Self {
             storage,

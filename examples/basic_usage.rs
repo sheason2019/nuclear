@@ -1,11 +1,12 @@
 use nuclear::Database;
+use nuclear::api::DatabaseBuilder;
 use nuclear::storage::WasiStorage;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = WasiStorage::new("./data");
     
-    let db = Database::builder(storage)
+    let db: Database<WasiStorage> = DatabaseBuilder::new(storage)
         .node_id("node1".to_string())
         .build()
         .await?;
@@ -14,8 +15,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let create_result = db.mutation(r#"
         mutation {
-            create_user(input: {name: "Alice", email: "alice@example.com"}) {
-                id
+            createRecord(collection: "users", data: {name: "Alice", email: "alice@example.com"}) {
+                _meta { id }
                 name
             }
         }
@@ -25,8 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let query_result = db.query(r#"
         query {
-            users {
-                id
+            records(collection: "users") {
+                _meta { id }
                 name
                 email
             }
@@ -37,49 +38,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     db.mutation(r#"
         mutation {
-            create_user(input: {name: "Bob", email: "bob@example.com"}) {
-                id
+            createRecord(collection: "users", data: {name: "Bob", email: "bob@example.com"}) {
+                _meta { id }
                 name
             }
         }
     "#).await?;
     
-    let filtered_result = db.query(r#"
+    let aggregate_result = db.query(r#"
         query {
-            users(where: { name: { eq: "Alice" } }) {
-                id
-                name
-                email
+            recordsAggregate(collection: "users") {
+                count
             }
         }
     "#).await?;
     
-    println!("Filtered result: {:?}", filtered_result);
-    
-    println!("\nSubscribing to user updates...");
-    let _stream = db.subscribe(r#"
-        subscription {
-            user_updated {
-                id
-                name
-            }
-        }
-    "#).await?;
-    
-    println!("Subscription active - waiting for changes...");
-    
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    
-    let _ = db.mutation(r#"
-        mutation {
-            update_user(id: "1", input: {name: "Alice Updated"}) {
-                id
-                name
-            }
-        }
-    "#).await;
-    
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    println!("Aggregate result: {:?}", aggregate_result);
     
     println!("\nExample completed successfully!");
     
