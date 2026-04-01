@@ -3,8 +3,8 @@ use super::error::StorageError;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
-#[derive(Debug, Clone)]
-pub struct FileHandle(u64);
+#[derive(Debug, Clone, Copy)]
+pub struct FileHandle(pub u64);
 
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
