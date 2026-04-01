@@ -232,3 +232,291 @@ impl Sort {
         }
     }
 }
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_filter_eq_match() {
+        let filter_json = json!({"name": {"eq": "Alice"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_eq_no_match() {
+        let filter_json = json!({"name": {"eq": "Alice"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Bob", "age": 25});
+        assert!(!filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_ne_match() {
+        let filter_json = json!({"name": {"ne": "Alice"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Bob", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_ne_no_match() {
+        let filter_json = json!({"name": {"ne": "Alice"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(!filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_gt_number() {
+        let filter_json = json!({"age": {"gt": 20}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_gt_no_match() {
+        let filter_json = json!({"age": {"gt": 30}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(!filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_gte() {
+        let filter_json = json!({"age": {"gte": 25}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_lt() {
+        let filter_json = json!({"age": {"lt": 30}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_lte() {
+        let filter_json = json!({"age": {"lte": 25}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_contains() {
+        let filter_json = json!({"name": {"contains": "li"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_contains_no_match() {
+        let filter_json = json!({"name": {"contains": "xyz"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(!filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_in() {
+        let filter_json = json!({"name": {"in": ["Alice", "Bob"]}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_in_no_match() {
+        let filter_json = json!({"name": {"in": ["Bob", "Charlie"]}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(!filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_multiple_conditions() {
+        let filter_json = json!({"age": {"gte": 20, "lte": 30}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_multiple_fields() {
+        let filter_json = json!({"name": {"eq": "Alice"}, "age": {"gt": 20}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_missing_field() {
+        let filter_json = json!({"email": {"eq": "alice@example.com"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice", "age": 25});
+        assert!(!filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_empty_json_returns_none() {
+        let filter_json = json!({});
+        assert!(Filter::from_json(&filter_json).is_none());
+    }
+
+    #[test]
+    fn test_filter_gt_string() {
+        let filter_json = json!({"name": {"gt": "Bob"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Charlie"});
+        assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_lte_string() {
+        let filter_json = json!({"name": {"lte": "Bob"}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Alice"});
+        assert!(filter.matches(&data));
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_sort_asc_numbers() {
+        let sort_json = json!({"age": "ASC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Charlie", "age": 28}),
+            json!({"name": "Alice", "age": 25}),
+            json!({"name": "Bob", "age": 30}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Alice");
+        assert_eq!(items[1].get("name").unwrap(), "Charlie");
+        assert_eq!(items[2].get("name").unwrap(), "Bob");
+    }
+
+    #[test]
+    fn test_sort_desc_numbers() {
+        let sort_json = json!({"age": "DESC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Charlie", "age": 28}),
+            json!({"name": "Alice", "age": 25}),
+            json!({"name": "Bob", "age": 30}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Bob");
+        assert_eq!(items[1].get("name").unwrap(), "Charlie");
+        assert_eq!(items[2].get("name").unwrap(), "Alice");
+    }
+
+    #[test]
+    fn test_sort_asc_strings() {
+        let sort_json = json!({"name": "ASC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Charlie", "age": 28}),
+            json!({"name": "Alice", "age": 25}),
+            json!({"name": "Bob", "age": 30}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Alice");
+        assert_eq!(items[1].get("name").unwrap(), "Bob");
+        assert_eq!(items[2].get("name").unwrap(), "Charlie");
+    }
+
+    #[test]
+    fn test_sort_desc_strings() {
+        let sort_json = json!({"name": "DESC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Charlie", "age": 28}),
+            json!({"name": "Alice", "age": 25}),
+            json!({"name": "Bob", "age": 30}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Charlie");
+        assert_eq!(items[1].get("name").unwrap(), "Bob");
+        assert_eq!(items[2].get("name").unwrap(), "Alice");
+    }
+
+    #[test]
+    fn test_sort_multiple_fields() {
+        let sort_json = json!({"age": "ASC", "name": "ASC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Charlie", "age": 25}),
+            json!({"name": "Alice", "age": 25}),
+            json!({"name": "Bob", "age": 30}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Alice");
+        assert_eq!(items[1].get("name").unwrap(), "Charlie");
+        assert_eq!(items[2].get("name").unwrap(), "Bob");
+    }
+
+    #[test]
+    fn test_sort_empty_returns_none() {
+        let sort_json = json!({});
+        assert!(Sort::from_json(&sort_json).is_none());
+    }
+
+    #[test]
+    fn test_sort_with_none_values() {
+        let sort_json = json!({"age": "ASC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Charlie", "age": 28}),
+            json!({"name": "Alice"}),
+            json!({"name": "Bob", "age": 30}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Alice");
+        assert_eq!(items[1].get("name").unwrap(), "Charlie");
+        assert_eq!(items[2].get("name").unwrap(), "Bob");
+    }
+
+    #[test]
+    fn test_sort_already_sorted() {
+        let sort_json = json!({"age": "ASC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Alice", "age": 25}),
+            json!({"name": "Charlie", "age": 28}),
+            json!({"name": "Bob", "age": 30}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Alice");
+        assert_eq!(items[1].get("name").unwrap(), "Charlie");
+        assert_eq!(items[2].get("name").unwrap(), "Bob");
+    }
+
+    #[test]
+    fn test_sort_reverse_sorted() {
+        let sort_json = json!({"age": "ASC"});
+        let sort = Sort::from_json(&sort_json).unwrap();
+        let mut items = vec![
+            json!({"name": "Bob", "age": 30}),
+            json!({"name": "Charlie", "age": 28}),
+            json!({"name": "Alice", "age": 25}),
+        ];
+        sort.sort(&mut items, |item, field| item.get(field).cloned());
+        assert_eq!(items[0].get("name").unwrap(), "Alice");
+        assert_eq!(items[1].get("name").unwrap(), "Charlie");
+        assert_eq!(items[2].get("name").unwrap(), "Bob");
+    }
+}

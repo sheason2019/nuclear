@@ -21,7 +21,7 @@ where
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("LWWMap", 2)?;
         state.serialize_field("entries", &self.entries)?;
-        state.serialize_field("node_id", &self.node_id)?;
+        state.serialize_field("nodeId", &self.node_id)?;
         state.end()
     }
 }
@@ -86,7 +86,7 @@ where
             }
         }
 
-        const FIELDS: &'static [&'static str] = &["entries", "nodeId"];
+        const FIELDS: &'static [&'static str] = &["entries", "node_id"];
         deserializer.deserialize_struct(
             "LWWMap",
             FIELDS,
@@ -157,10 +157,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_lww_map_new_is_empty() {
+        let map: LWWMap<String, String> = LWWMap::new("node1");
+        assert_eq!(map.keys().count(), 0);
+        assert_eq!(map.values().count(), 0);
+    }
+
+    #[test]
     fn test_lww_map_insert() {
         let mut map = LWWMap::new("node1");
         map.insert("key1".to_string(), "value1".to_string());
         assert_eq!(map.get(&"key1".to_string()), Some(&"value1".to_string()));
+    }
+
+    #[test]
+    fn test_lww_map_insert_overwrites() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key1".to_string(), "value2".to_string());
+        assert_eq!(map.get(&"key1".to_string()), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_lww_map_insert_multiple_keys() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
+        map.insert("key3".to_string(), "value3".to_string());
+
+        assert_eq!(map.get(&"key1".to_string()), Some(&"value1".to_string()));
+        assert_eq!(map.get(&"key2".to_string()), Some(&"value2".to_string()));
+        assert_eq!(map.get(&"key3".to_string()), Some(&"value3".to_string()));
+        assert_eq!(map.keys().count(), 3);
+    }
+
+    #[test]
+    fn test_lww_map_get_nonexistent() {
+        let map: LWWMap<String, String> = LWWMap::new("node1");
+        assert_eq!(map.get(&"key1".to_string()), None);
+    }
+
+    #[test]
+    fn test_lww_map_remove() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.remove("key1".to_string());
+        assert_eq!(map.get(&"key1".to_string()), None);
+    }
+
+    #[test]
+    fn test_lww_map_remove_nonexistent() {
+        let mut map: LWWMap<String, String> = LWWMap::new("node1");
+        map.remove("key1".to_string());
+        assert_eq!(map.get(&"key1".to_string()), None);
+    }
+
+    #[test]
+    fn test_lww_map_remove_then_insert() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.remove("key1".to_string());
+        map.insert("key1".to_string(), "value2".to_string());
+        assert_eq!(map.get(&"key1".to_string()), Some(&"value2".to_string()));
     }
 
     #[test]
@@ -177,10 +235,156 @@ mod tests {
     }
 
     #[test]
-    fn test_lww_map_remove() {
+    fn test_lww_map_merge_later_wins() {
+        let mut map1 = LWWMap::new("node1");
+        map1.insert("key1".to_string(), "value1".to_string());
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut map2 = LWWMap::new("node2");
+        map2.insert("key1".to_string(), "value2".to_string());
+
+        map1.merge(&map2);
+        assert_eq!(map1.get(&"key1".to_string()), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_lww_map_merge_equal_timestamp() {
+        let mut map1 = LWWMap::new("node1");
+        map1.insert("key1".to_string(), "value1".to_string());
+
+        let mut map2 = LWWMap::new("node2");
+        map2.insert("key1".to_string(), "value2".to_string());
+
+        map1.merge(&map2);
+        assert_eq!(map1.get(&"key1".to_string()), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_lww_map_merge_with_remove() {
+        let mut map1 = LWWMap::new("node1");
+        map1.insert("key1".to_string(), "value1".to_string());
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut map2 = LWWMap::new("node2");
+        map2.remove("key1".to_string());
+
+        map1.merge(&map2);
+        assert_eq!(map1.get(&"key1".to_string()), None);
+    }
+
+    #[test]
+    fn test_lww_map_merge_self() {
         let mut map = LWWMap::new("node1");
         map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
+
+        let map_clone = map.clone();
+        map.merge(&map_clone);
+
+        assert_eq!(map.get(&"key1".to_string()), Some(&"value1".to_string()));
+        assert_eq!(map.get(&"key2".to_string()), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_lww_map_keys() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
+
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["key1", "key2"]);
+    }
+
+    #[test]
+    fn test_lww_map_values() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
+
+        let mut values: Vec<String> = map.values().cloned().collect();
+        values.sort();
+        assert_eq!(values, vec!["value1", "value2"]);
+    }
+
+    #[test]
+    fn test_lww_map_values_excludes_removed() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
         map.remove("key1".to_string());
-        assert_eq!(map.get(&"key1".to_string()), None);
+
+        let values: Vec<String> = map.values().cloned().collect();
+        assert_eq!(values, vec!["value2"]);
+    }
+
+    #[test]
+    fn test_lww_map_with_integer_keys() {
+        let mut map = LWWMap::new("node1");
+        map.insert(1, "value1".to_string());
+        map.insert(2, "value2".to_string());
+
+        assert_eq!(map.get(&1), Some(&"value1".to_string()));
+        assert_eq!(map.get(&2), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_lww_map_with_integer_values() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), 42);
+        map.insert("key2".to_string(), 100);
+
+        assert_eq!(map.get(&"key1".to_string()), Some(&42));
+        assert_eq!(map.get(&"key2".to_string()), Some(&100));
+    }
+
+    #[test]
+    fn test_lww_map_serialization() {
+        let mut map = LWWMap::new("node1");
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
+
+        let json = serde_json::to_string(&map).unwrap();
+        let deserialized: LWWMap<String, String> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.get(&"key1".to_string()),
+            Some(&"value1".to_string())
+        );
+        assert_eq!(
+            deserialized.get(&"key2".to_string()),
+            Some(&"value2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_lww_map_complex_merge() {
+        let mut map1 = LWWMap::new("node1");
+        map1.insert("key1".to_string(), "value1".to_string());
+        map1.insert("key2".to_string(), "value2".to_string());
+
+        let mut map2 = LWWMap::new("node2");
+        map2.insert("key2".to_string(), "value2_updated".to_string());
+        map2.insert("key3".to_string(), "value3".to_string());
+
+        let mut map3 = LWWMap::new("node3");
+        map3.insert("key1".to_string(), "value1_updated".to_string());
+        map3.insert("key4".to_string(), "value4".to_string());
+
+        map1.merge(&map2);
+        map1.merge(&map3);
+
+        assert_eq!(
+            map1.get(&"key1".to_string()),
+            Some(&"value1_updated".to_string())
+        );
+        assert_eq!(
+            map1.get(&"key2".to_string()),
+            Some(&"value2_updated".to_string())
+        );
+        assert_eq!(map1.get(&"key3".to_string()), Some(&"value3".to_string()));
+        assert_eq!(map1.get(&"key4".to_string()), Some(&"value4".to_string()));
     }
 }
