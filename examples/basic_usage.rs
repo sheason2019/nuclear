@@ -11,51 +11,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
     
-    println!("Database initialized with node_id: node1");
+    println!("=== Nuclear WASM CRDT Database Demo ===\n");
     
-    let create_result = db.mutation(r#"
+    db.mutation(r#"
         mutation {
-            createRecord(collection: "users", data: {name: "Alice", email: "alice@example.com"}) {
-                _meta { id }
+            createRecord(collection: "users", data: {name: "Alice", age: 25, email: "alice@example.com"}) {
+                meta { id }
                 name
             }
         }
     "#).await?;
     
-    println!("Created user: {:?}", create_result);
+    db.mutation(r#"
+        mutation {
+            createRecord(collection: "users", data: {name: "Bob", age: 30, email: "bob@example.com"}) {
+                meta { id }
+                name
+            }
+        }
+    "#).await?;
     
-    let query_result = db.query(r#"
+    db.mutation(r#"
+        mutation {
+            createRecord(collection: "users", data: {name: "Charlie", age: 28, email: "charlie@example.com"}) {
+                meta { id }
+                name
+            }
+        }
+    "#).await?;
+    
+    println!("Created 3 users (Alice, Bob, Charlie)\n");
+    
+    let result = db.query(r#"
         query {
             records(collection: "users") {
-                _meta { id }
+                meta { id }
                 name
+                age
                 email
             }
         }
     "#).await?;
+    println!("All users:\n{:?}\n", result);
     
-    println!("Query result: {:?}", query_result);
+    let result = db.query(r#"
+        query {
+            records(collection: "users", filter: {age: {gt: 26}}) {
+                meta { id }
+                name
+                age
+            }
+        }
+    "#).await?;
+    println!("Users with age > 26:\n{:?}\n", result);
     
-    db.mutation(r#"
-        mutation {
-            createRecord(collection: "users", data: {name: "Bob", email: "bob@example.com"}) {
-                _meta { id }
+    let result = db.query(r#"
+        query {
+            records(collection: "users", filter: {name: {contains: "li"}}) {
+                meta { id }
                 name
             }
         }
     "#).await?;
+    println!("Users with name containing 'li':\n{:?}\n", result);
     
-    let aggregate_result = db.query(r#"
+    let result = db.query(r#"
+        query {
+            records(collection: "users", orderBy: {age: DESC}) {
+                meta { id }
+                name
+                age
+            }
+        }
+    "#).await?;
+    println!("Users sorted by age (DESC):\n{:?}\n", result);
+    
+    let result = db.query(r#"
+        query {
+            records(collection: "users", orderBy: {name: ASC}) {
+                meta { id }
+                name
+                age
+            }
+        }
+    "#).await?;
+    println!("Users sorted by name (ASC):\n{:?}\n", result);
+    
+    let result = db.query(r#"
+        query {
+            records(collection: "users", filter: {age: {gte: 26}}, orderBy: {age: ASC}, first: 2) {
+                meta { id }
+                name
+                age
+            }
+        }
+    "#).await?;
+    println!("Users with age >= 26, sorted by age ASC, first 2:\n{:?}\n", result);
+    
+    let result = db.query(r#"
         query {
             recordsAggregate(collection: "users") {
                 count
             }
         }
     "#).await?;
+    println!("Aggregate result:\n{:?}\n", result);
     
-    println!("Aggregate result: {:?}", aggregate_result);
-    
-    println!("\nExample completed successfully!");
+    println!("\n=== Demo completed successfully! ===");
     
     Ok(())
 }

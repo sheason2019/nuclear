@@ -1,6 +1,7 @@
 use async_graphql::*;
 use futures::stream::{self, Stream};
 use super::scalars::{Json, DateTime};
+use super::filter::{Filter, Sort};
 use crate::api::database::GraphqlDatabase;
 
 #[derive(SimpleObject, Debug, Clone)]
@@ -26,8 +27,20 @@ impl Record {
         Json(self.data.clone())
     }
     
-    async fn _meta(&self) -> &Meta {
+    async fn meta(&self) -> &Meta {
         &self.meta
+    }
+    
+    async fn name(&self) -> Option<String> {
+        self.data.get("name").and_then(|v| v.as_str()).map(String::from)
+    }
+    
+    async fn email(&self) -> Option<String> {
+        self.data.get("email").and_then(|v| v.as_str()).map(String::from)
+    }
+    
+    async fn age(&self) -> Option<i64> {
+        self.data.get("age").and_then(|v| v.as_i64())
     }
 }
 
@@ -39,8 +52,8 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         collection: String,
-        _filter: Option<Json>,
-        _order_by: Option<Json>,
+        filter: Option<Json>,
+        order_by: Option<Json>,
         first: Option<i32>,
         offset: Option<i32>,
     ) -> Result<Vec<Record>> {
@@ -62,6 +75,20 @@ impl QueryRoot {
                 },
             }
         }).collect();
+        
+        if let Some(filter_json) = filter {
+            if let Some(filter) = Filter::from_json(&filter_json.0) {
+                result.retain(|record| filter.matches(&record.data));
+            }
+        }
+        
+        if let Some(order_by_json) = order_by {
+            if let Some(sort) = Sort::from_json(&order_by_json.0) {
+                sort.sort(&mut result, |record, field| {
+                    record.data.get(field).cloned()
+                });
+            }
+        }
         
         if let Some(offset) = offset {
             if offset as usize >= result.len() {
