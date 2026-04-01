@@ -1,11 +1,4 @@
-// API module - public interface
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Database;
-
-impl Database {
-    pub fn new() -> Self {
-        Self
-    }
-}
+pub mod database;
+pub mod builder;
+pub use database::Database;
+pub use builder::DatabaseBuilder;
