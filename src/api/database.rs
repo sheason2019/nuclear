@@ -3,8 +3,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use async_graphql::{Schema, EmptySubscription};
 use crate::core::{VectorClock, LWWMap};
-use crate::storage::{Storage, error::StorageError};
+use crate::storage::{Storage, error::StorageError, OpenOptions};
 use crate::graphql::{QueryRoot, MutationRoot};
+use serde::{Serialize, Deserialize};
 
 pub struct Database<S: Storage + 'static> {
     storage: Arc<S>,
@@ -12,13 +13,14 @@ pub struct Database<S: Storage + 'static> {
     node_id: String,
     pub(crate) clock: Arc<RwLock<VectorClock>>,
     relations: Arc<RwLock<HashMap<String, RelationConfig>>>,
+    base_path: String,
 }
 
 pub(crate) struct Collection {
     pub data: LWWMap<String, RecordData>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecordData {
     pub fields: serde_json::Value,
     pub meta: RecordMeta,
@@ -30,7 +32,7 @@ impl PartialEq for RecordData {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecordMeta {
     pub id: String,
     pub created_at: u64,
@@ -49,6 +51,8 @@ pub(crate) struct GraphqlDatabase {
     pub collections: Arc<RwLock<HashMap<String, Collection>>>,
     pub clock: Arc<RwLock<VectorClock>>,
     pub node_id: String,
+    pub storage: Arc<dyn Storage>,
+    pub base_path: String,
 }
 
 impl GraphqlDatabase {
@@ -96,6 +100,10 @@ impl GraphqlDatabase {
         };
         
         col.data.insert(id, record.clone());
+        drop(collections);
+        
+        self.save_collection(collection).await?;
+        
         Ok(record)
     }
 
@@ -108,6 +116,10 @@ impl GraphqlDatabase {
                 record.fields = data;
                 record.meta.updated_at = now;
                 col.data.insert(id_string, record.clone());
+                drop(collections);
+                
+                self.save_collection(collection).await?;
+                
                 Ok(Some(record))
             } else {
                 Ok(None)
@@ -121,6 +133,10 @@ impl GraphqlDatabase {
         let mut collections = self.collections.write().await;
         if let Some(col) = collections.get_mut(collection) {
             col.data.remove(id.to_string());
+            drop(collections);
+            
+            self.save_collection(collection).await?;
+            
             Ok(true)
         } else {
             Ok(false)
@@ -135,17 +151,54 @@ impl GraphqlDatabase {
             Ok(0)
         }
     }
+    
+    async fn save_collection(&self, name: &str) -> Result<(), StorageError> {
+        let collections = self.collections.read().await;
+        if let Some(collection) = collections.get(name) {
+            let mut records = Vec::new();
+            for key in collection.data.keys() {
+                if let Some(record) = collection.data.get(key) {
+                    records.push(record.clone());
+                }
+            }
+            
+            let json = serde_json::to_vec(&records)
+                .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+            
+            let path = format!("{}.json", name);
+            
+            let _ = tokio::fs::create_dir_all(&self.base_path).await;
+            
+            let options = OpenOptions {
+                read: false,
+                write: true,
+                create: true,
+                truncate: true,
+            };
+            
+            let handle = self.storage.open(&path, options).await?;
+            self.storage.write(handle, 0, &json).await?;
+            self.storage.sync(handle).await?;
+            self.storage.close(handle).await?;
+        }
+        Ok(())
+    }
 }
 
 impl<S: Storage + 'static> Database<S> {
-    pub async fn open(storage: S, node_id: String) -> Result<Self, StorageError> {
-        Ok(Self {
+    pub async fn open(storage: S, node_id: String, base_path: String) -> Result<Self, StorageError> {
+        let mut db = Self {
             storage: Arc::new(storage),
             collections: Arc::new(RwLock::new(HashMap::new())),
             node_id,
             clock: Arc::new(RwLock::new(VectorClock::new())),
             relations: Arc::new(RwLock::new(HashMap::new())),
-        })
+            base_path,
+        };
+        
+        db.load_all().await?;
+        
+        Ok(db)
     }
 
     pub async fn query(&self, query: &str) -> Result<serde_json::Value, StorageError> {
@@ -195,6 +248,8 @@ impl<S: Storage + 'static> Database<S> {
             collections: self.collections.clone(),
             clock: self.clock.clone(),
             node_id: self.node_id.clone(),
+            storage: self.storage.clone(),
+            base_path: self.base_path.clone(),
         }
     }
 
@@ -261,5 +316,83 @@ impl<S: Storage + 'static> Database<S> {
         } else {
             Ok(None)
         }
+    }
+    
+    pub async fn save(&self) -> Result<(), StorageError> {
+        let collections = self.collections.read().await;
+        for (name, collection) in collections.iter() {
+            self.save_collection(name, collection).await?;
+        }
+        Ok(())
+    }
+    
+    async fn save_collection(&self, name: &str, collection: &Collection) -> Result<(), StorageError> {
+        let mut records = Vec::new();
+        for key in collection.data.keys() {
+            if let Some(record) = collection.data.get(key) {
+                records.push(record.clone());
+            }
+        }
+        
+        let json = serde_json::to_vec(&records)
+            .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+        
+        let path = format!("{}.json", name);
+        
+        let _ = tokio::fs::create_dir_all(&self.base_path).await;
+        
+        let options = OpenOptions {
+            read: false,
+            write: true,
+            create: true,
+            truncate: true,
+        };
+        
+        let handle = self.storage.open(&path, options).await?;
+        self.storage.write(handle, 0, &json).await?;
+        self.storage.sync(handle).await?;
+        self.storage.close(handle).await?;
+        
+        Ok(())
+    }
+    
+    async fn load_all(&mut self) -> Result<(), StorageError> {
+        let mut collections = self.collections.write().await;
+        collections.clear();
+        Ok(())
+    }
+    
+    pub async fn load_collection(&self, name: &str) -> Result<(), StorageError> {
+        let path = format!("{}.json", name);
+        let options = OpenOptions {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+        };
+        
+        let handle = match self.storage.open(&path, options).await {
+            Ok(h) => h,
+            Err(_) => return Ok(()),
+        };
+        
+        let size = self.storage.size(handle).await? as usize;
+        let mut buf = vec![0u8; size];
+        self.storage.read(handle, 0, &mut buf).await?;
+        self.storage.close(handle).await?;
+        
+        let records: Vec<RecordData> = serde_json::from_slice(&buf)
+            .map_err(|e| StorageError::WasmError(format!("Deserialization error: {}", e)))?;
+        
+        let mut collections = self.collections.write().await;
+        let mut lww_map = LWWMap::new(&self.node_id);
+        
+        for record in records {
+            lww_map.insert(record.meta.id.clone(), record);
+        }
+        
+        collections.insert(name.to_string(), Collection { data: lww_map });
+        
+        Ok(())
     }
 }

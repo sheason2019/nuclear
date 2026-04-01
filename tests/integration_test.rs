@@ -1,4 +1,5 @@
 use nuclear::Database;
+use nuclear::api::DatabaseBuilder;
 use nuclear::storage::WasiStorage;
 use tempfile::tempdir;
 
@@ -6,56 +7,91 @@ use tempfile::tempdir;
 async fn test_database_crud() {
     let dir = tempdir().unwrap();
     let storage = WasiStorage::new(dir.path());
-    let db = Database::open(storage, "node1".to_string()).await.unwrap();
+    let db = DatabaseBuilder::new(storage)
+        .node_id("node1".to_string())
+        .base_path(dir.path().to_str().unwrap().to_string())
+        .build()
+        .await
+        .unwrap();
     
     let result = db.mutation(r#"
         mutation {
-            create_user(input: {name: "Alice", email: "alice@example.com"}) {
-                id
+            createRecord(collection: "users", data: {name: "Alice", email: "alice@example.com"}) {
+                meta { id }
                 name
             }
         }
     "#).await;
     
-    assert!(result.is_err() || result.unwrap().get("data").is_some());
+    assert!(result.is_ok());
     
     let result = db.query(r#"
         query {
-            users {
-                id
+            records(collection: "users") {
+                meta { id }
                 name
                 email
             }
         }
     "#).await;
     
-    assert!(result.is_err() || result.unwrap().get("data").is_some());
+    assert!(result.is_ok());
 }
 
 #[tokio::test]
-async fn test_database_sync() {
-    let dir1 = tempdir().unwrap();
-    let dir2 = tempdir().unwrap();
+async fn test_database_persistence() {
+    let dir = tempdir().unwrap();
+    let base_path = dir.path().to_str().unwrap().to_string();
     
-    let storage1 = WasiStorage::new(dir1.path());
-    let storage2 = WasiStorage::new(dir2.path());
-    
-    let db1 = Database::open(storage1, "node1".to_string()).await.unwrap();
-    let db2 = Database::open(storage2, "node2".to_string()).await.unwrap();
-    
-    let result = db1.mutation(r#"
-        mutation {
-            create_user(input: {name: "Bob", email: "bob@example.com"}) {
-                id
+    {
+        let storage = WasiStorage::new(dir.path());
+        let db = DatabaseBuilder::new(storage)
+            .node_id("node1".to_string())
+            .base_path(base_path.clone())
+            .build()
+            .await
+            .unwrap();
+        
+        db.mutation(r#"
+            mutation {
+                createRecord(collection: "users", data: {name: "Alice", age: 25}) {
+                    meta { id }
+                }
             }
-        }
-    "#).await;
+        "#).await.unwrap();
+        
+        db.mutation(r#"
+            mutation {
+                createRecord(collection: "users", data: {name: "Bob", age: 30}) {
+                    meta { id }
+                }
+            }
+        "#).await.unwrap();
+    }
     
-    assert!(result.is_err() || result.unwrap().get("data").is_some());
-    
-    let result = db2.query("query { users { name } }").await;
-    
-    assert!(result.is_err() || result.unwrap().get("data").is_some());
+    {
+        let storage = WasiStorage::new(dir.path());
+        let db = DatabaseBuilder::new(storage)
+            .node_id("node1".to_string())
+            .base_path(base_path)
+            .build()
+            .await
+            .unwrap();
+        
+        db.load_collection("users").await.unwrap();
+        
+        let result = db.query(r#"
+            query {
+                records(collection: "users") {
+                    name
+                    age
+                }
+            }
+        "#).await.unwrap();
+        
+        let records = result.get("records").unwrap().as_array().unwrap();
+        assert_eq!(records.len(), 2);
+    }
 }
 
 #[tokio::test]
@@ -63,7 +99,12 @@ async fn test_database_open_and_close() {
     let dir = tempdir().unwrap();
     let storage = WasiStorage::new(dir.path());
     
-    let db = Database::open(storage, "test_node".to_string()).await.unwrap();
+    let db = DatabaseBuilder::new(storage)
+        .node_id("test_node".to_string())
+        .base_path(dir.path().to_str().unwrap().to_string())
+        .build()
+        .await
+        .unwrap();
     
     let _ = db.query("query { __typename }").await;
 }

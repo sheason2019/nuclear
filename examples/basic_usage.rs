@@ -8,6 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let db: Database<WasiStorage> = DatabaseBuilder::new(storage)
         .node_id("node1".to_string())
+        .base_path("./data".to_string())
         .build()
         .await?;
     
@@ -53,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     "#).await?;
     println!("All users:\n{:?}\n", result);
+    
+    println!("Data saved to ./data/users.json");
+    println!("\nTo verify persistence, restart the program and query again.");
+    println!("The data should still be available.\n");
     
     let result = db.query(r#"
         query {

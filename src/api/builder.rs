@@ -5,6 +5,7 @@ use super::database::Database;
 pub struct DatabaseBuilder<S: Storage> {
     storage: S,
     node_id: Option<String>,
+    base_path: Option<String>,
     sync_interval: Duration,
     cache_size: usize,
     relations: Vec<RelationConfig>,
@@ -23,6 +24,7 @@ impl<S: Storage + 'static> DatabaseBuilder<S> {
         Self {
             storage,
             node_id: None,
+            base_path: None,
             sync_interval: Duration::from_secs(1),
             cache_size: 1024 * 1024 * 100,
             relations: Vec::new(),
@@ -31,6 +33,11 @@ impl<S: Storage + 'static> DatabaseBuilder<S> {
 
     pub fn node_id(mut self, node_id: String) -> Self {
         self.node_id = Some(node_id);
+        self
+    }
+    
+    pub fn base_path(mut self, base_path: String) -> Self {
+        self.base_path = Some(base_path);
         self
     }
 
@@ -56,7 +63,8 @@ impl<S: Storage + 'static> DatabaseBuilder<S> {
 
     pub async fn build(self) -> Result<Database<S>, crate::storage::error::StorageError> {
         let node_id = self.node_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let db = Database::open(self.storage, node_id).await?;
+        let base_path = self.base_path.unwrap_or_else(|| "./data".to_string());
+        let db = Database::open(self.storage, node_id, base_path).await?;
         
         for config in self.relations {
             db.register_relation(
