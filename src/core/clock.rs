@@ -22,6 +22,10 @@ impl VectorClock {
         self.clocks.get(node_id).copied().unwrap_or(0)
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.clocks.keys()
+    }
+
     pub fn merge(&mut self, other: &VectorClock) {
         for (node_id, &counter) in &other.clocks {
             let entry = self.clocks.entry(node_id.clone()).or_insert(0);

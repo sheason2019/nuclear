@@ -41,7 +41,17 @@ impl ChangeLog {
     pub fn get_entries_since(&self, since: &VectorClock) -> Vec<&ChangeEntry> {
         self.entries
             .iter()
-            .filter(|entry| entry.vector_clock.happens_before(since))
+            .filter(|entry| {
+                let all_nodes: std::collections::HashSet<_> =
+                    since.keys().chain(entry.vector_clock.keys()).collect();
+
+                for node in all_nodes {
+                    if entry.vector_clock.get(node) > since.get(node) {
+                        return true;
+                    }
+                }
+                false
+            })
             .collect()
     }
 
