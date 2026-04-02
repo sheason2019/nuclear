@@ -1,0 +1,71 @@
+{
+  "name": "nuclear",
+  "version": "0.1.0",
+  "description": "WASM CRDT NoSQL Database with GraphQL",
+  "main": "./dist/node/nuclear.js",
+  "module": "./dist/web/nuclear.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./dist/types/index.d.ts",
+        "import": "./dist/web/nuclear.js",
+        "default": "./dist/web/nuclear.js"
+      },
+      "node": {
+        "types": "./dist/types/index.d.ts",
+        "import": "./dist/node/nuclear.js",
+        "require": "./dist/node/nuclear.js"
+      },
+      "deno": {
+        "types": "./dist/types/index.d.ts",
+        "import": "./dist/web/nuclear.js"
+      },
+      "bun": {
+        "types": "./dist/types/index.d.ts",
+        "import": "./dist/web/nuclear.js"
+      },
+      "default": {
+        "types": "./dist/types/index.d.ts",
+        "import": "./dist/web/nuclear.js"
+      }
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "build:web": "wasm-pack build --target web --out-dir pkg/web",
+    "build:node": "wasm-pack build --target nodejs --out-dir pkg/node",
+    "build:bundler": "wasm-pack build --target bundler --out-dir pkg/bundler",
+    "build:all": "npm run build:web && npm run build:node && npm run build:bundler",
+    "test": "cargo test",
+    "test:js": "node tests/js/test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "wasm",
+    "crdt",
+    "database",
+    "nosql",
+    "graphql",
+    "embedded",
+    "p2p",
+    "sync"
+  ],
+  "author": "sheason2019",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sheason2019/nuclear.git"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}

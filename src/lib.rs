@@ -4,4 +4,7 @@ pub mod graphql;
 pub mod sync;
 pub mod api;
 
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 pub use api::Database;
