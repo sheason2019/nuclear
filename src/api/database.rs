@@ -530,25 +530,23 @@ impl<S: Storage + 'static> Database<S> {
                     
                     let now = chrono::Utc::now().timestamp_millis() as u64;
                     
-                    if let Some(mut record) = col.data.get(&change.record_id).cloned() {
+                    if let Some(record) = col.data.get(&change.record_id).cloned() {
                         if change.vector_clock.happens_before(&record.meta.clock) {
-                            record.fields = data;
-                            record.meta.updated_at = now;
-                            record.meta.clock = change.vector_clock.clone();
-                            col.data.insert(change.record_id.clone(), record);
+                            drop(collections);
+                            return Ok(());
                         }
-                    } else {
-                        let record = RecordData {
-                            fields: data,
-                            meta: RecordMeta {
-                                id: change.record_id.clone(),
-                                created_at: now,
-                                updated_at: now,
-                                clock: change.vector_clock.clone(),
-                            },
-                        };
-                        col.data.insert(change.record_id.clone(), record);
                     }
+                    
+                    let record = RecordData {
+                        fields: data,
+                        meta: RecordMeta {
+                            id: change.record_id.clone(),
+                            created_at: now,
+                            updated_at: now,
+                            clock: change.vector_clock.clone(),
+                        },
+                    };
+                    col.data.insert(change.record_id.clone(), record);
                     
                     drop(collections);
                     self.save_collection_by_name(&change.collection).await?;
