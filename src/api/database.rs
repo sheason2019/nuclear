@@ -5,6 +5,7 @@ use async_graphql::{Schema, EmptySubscription};
 use crate::core::{VectorClock, LWWMap};
 use crate::storage::{Storage, error::StorageError, OpenOptions};
 use crate::graphql::{QueryRoot, MutationRoot, EventBus, Event, EventType};
+use crate::sync::{ChangeLog, ChangeEntry, Operation, SyncMessage};
 use serde::{Serialize, Deserialize};
 
 pub struct Database<S: Storage + 'static> {
@@ -15,6 +16,7 @@ pub struct Database<S: Storage + 'static> {
     relations: Arc<RwLock<HashMap<String, RelationConfig>>>,
     base_path: String,
     event_bus: EventBus,
+    changelog: Arc<RwLock<ChangeLog>>,
 }
 
 pub(crate) struct Collection {
@@ -55,6 +57,7 @@ pub(crate) struct GraphqlDatabase {
     pub storage: Arc<dyn Storage>,
     pub base_path: String,
     pub event_bus: EventBus,
+    pub changelog: Arc<RwLock<ChangeLog>>,
 }
 
 impl GraphqlDatabase {
@@ -91,18 +94,35 @@ impl GraphqlDatabase {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis() as u64;
         
+        let mut clock = self.clock.write().await;
+        clock.increment(&self.node_id);
+        let current_clock = clock.clone();
+        drop(clock);
+        
         let record = RecordData {
-            fields: data,
+            fields: data.clone(),
             meta: RecordMeta {
                 id: id.clone(),
                 created_at: now,
                 updated_at: now,
-                clock: VectorClock::new(),
+                clock: current_clock.clone(),
             },
         };
         
         col.data.insert(id.clone(), record.clone());
         drop(collections);
+        
+        let mut changelog = self.changelog.write().await;
+        changelog.add_entry(ChangeEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now,
+            collection: collection.to_string(),
+            record_id: id.clone(),
+            operation: Operation::Create,
+            data: Some(data),
+            vector_clock: current_clock,
+        });
+        drop(changelog);
         
         self.save_collection(collection).await?;
         
@@ -122,10 +142,29 @@ impl GraphqlDatabase {
             let id_string = id.to_string();
             if let Some(mut record) = col.data.get(&id_string).cloned() {
                 let now = chrono::Utc::now().timestamp_millis() as u64;
-                record.fields = data;
+                
+                let mut clock = self.clock.write().await;
+                clock.increment(&self.node_id);
+                let current_clock = clock.clone();
+                drop(clock);
+                
+                record.fields = data.clone();
                 record.meta.updated_at = now;
+                record.meta.clock = current_clock.clone();
                 col.data.insert(id_string, record.clone());
                 drop(collections);
+                
+                let mut changelog = self.changelog.write().await;
+                changelog.add_entry(ChangeEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now,
+                    collection: collection.to_string(),
+                    record_id: id.to_string(),
+                    operation: Operation::Update,
+                    data: Some(data),
+                    vector_clock: current_clock,
+                });
+                drop(changelog);
                 
                 self.save_collection(collection).await?;
                 
@@ -150,6 +189,25 @@ impl GraphqlDatabase {
         if let Some(col) = collections.get_mut(collection) {
             col.data.remove(id.to_string());
             drop(collections);
+            
+            let now = chrono::Utc::now().timestamp_millis() as u64;
+            
+            let mut clock = self.clock.write().await;
+            clock.increment(&self.node_id);
+            let current_clock = clock.clone();
+            drop(clock);
+            
+            let mut changelog = self.changelog.write().await;
+            changelog.add_entry(ChangeEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now,
+                collection: collection.to_string(),
+                record_id: id.to_string(),
+                operation: Operation::Delete,
+                data: None,
+                vector_clock: current_clock,
+            });
+            drop(changelog);
             
             self.save_collection(collection).await?;
             
@@ -218,6 +276,7 @@ impl<S: Storage + 'static> Database<S> {
             relations: Arc::new(RwLock::new(HashMap::new())),
             base_path,
             event_bus: EventBus::new(),
+            changelog: Arc::new(RwLock::new(ChangeLog::new())),
         };
         
         db.load_all().await?;
@@ -275,6 +334,7 @@ impl<S: Storage + 'static> Database<S> {
             storage: self.storage.clone(),
             base_path: self.base_path.clone(),
             event_bus: self.event_bus.clone(),
+            changelog: self.changelog.clone(),
         }
     }
 
@@ -419,5 +479,103 @@ impl<S: Storage + 'static> Database<S> {
         collections.insert(name.to_string(), Collection { data: lww_map });
         
         Ok(())
+    }
+    
+    pub async fn get_sync_request(&self) -> SyncMessage {
+        let clock = self.clock.read().await;
+        SyncMessage::SyncRequest {
+            from: self.node_id.clone(),
+            clock: clock.clone(),
+        }
+    }
+    
+    pub async fn get_changes_since(&self, since: &VectorClock) -> Result<Vec<ChangeEntry>, StorageError> {
+        let changelog = self.changelog.read().await;
+        let entries = changelog.get_entries_since(since);
+        Ok(entries.into_iter().cloned().collect())
+    }
+    
+    pub async fn apply_sync_response(&self, response: SyncMessage) -> Result<(), StorageError> {
+        match response {
+            SyncMessage::SyncResponse { from: _, clock, changes } => {
+                for change in changes {
+                    self.apply_change(change).await?;
+                }
+                
+                let mut my_clock = self.clock.write().await;
+                my_clock.merge(&clock);
+                drop(my_clock);
+                
+                Ok(())
+            }
+            _ => Err(StorageError::WasmError("Invalid sync response".to_string())),
+        }
+    }
+    
+    async fn apply_change(&self, change: ChangeEntry) -> Result<(), StorageError> {
+        let mut my_clock = self.clock.write().await;
+        my_clock.merge(&change.vector_clock);
+        drop(my_clock);
+        
+        let mut changelog = self.changelog.write().await;
+        changelog.add_entry(change.clone());
+        drop(changelog);
+        
+        match change.operation {
+            Operation::Create | Operation::Update => {
+                if let Some(data) = change.data {
+                    let mut collections = self.collections.write().await;
+                    let col = collections.entry(change.collection.clone())
+                        .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id) });
+                    
+                    let now = chrono::Utc::now().timestamp_millis() as u64;
+                    
+                    if let Some(mut record) = col.data.get(&change.record_id).cloned() {
+                        if change.vector_clock.happens_before(&record.meta.clock) {
+                            record.fields = data;
+                            record.meta.updated_at = now;
+                            record.meta.clock = change.vector_clock.clone();
+                            col.data.insert(change.record_id.clone(), record);
+                        }
+                    } else {
+                        let record = RecordData {
+                            fields: data,
+                            meta: RecordMeta {
+                                id: change.record_id.clone(),
+                                created_at: now,
+                                updated_at: now,
+                                clock: change.vector_clock.clone(),
+                            },
+                        };
+                        col.data.insert(change.record_id.clone(), record);
+                    }
+                    
+                    drop(collections);
+                    self.save_collection_by_name(&change.collection).await?;
+                }
+            }
+            Operation::Delete => {
+                let mut collections = self.collections.write().await;
+                if let Some(col) = collections.get_mut(&change.collection) {
+                    col.data.remove(change.record_id);
+                }
+                drop(collections);
+                self.save_collection_by_name(&change.collection).await?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    async fn save_collection_by_name(&self, name: &str) -> Result<(), StorageError> {
+        let collections = self.collections.read().await;
+        if let Some(collection) = collections.get(name) {
+            self.save_collection(name, collection).await?;
+        }
+        Ok(())
+    }
+    
+    pub async fn get_clock(&self) -> VectorClock {
+        self.clock.read().await.clone()
     }
 }
