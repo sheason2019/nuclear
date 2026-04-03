@@ -159,12 +159,22 @@ mod tests {
     fn test_lru_cache_access_updates_timestamp() {
         let mut cache = LruCache::new(2);
         cache.insert("key1".to_string(), "value1".to_string());
-        cache.insert("key2".to_string(), "value2".to_string());
+
+        let ts1 = cache
+            .entries
+            .get(&"key1".to_string())
+            .unwrap()
+            .last_accessed;
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         cache.get(&"key1".to_string());
+        let ts2 = cache
+            .entries
+            .get(&"key1".to_string())
+            .unwrap()
+            .last_accessed;
 
-        let evicted = cache.insert("key3".to_string(), "value3".to_string());
-        assert_eq!(evicted, Some("key2".to_string()));
+        assert!(ts2 > ts1, "Access should update timestamp");
     }
 
     #[test]

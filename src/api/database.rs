@@ -419,10 +419,10 @@ impl<S: Storage + 'static> Database<S> {
             }
         }
         
-        let json = serde_json::to_vec(&records)
+        let data = bincode::serialize(&records)
             .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
         
-        let path = format!("{}.json", name);
+        let path = format!("{}.bin", name);
         
         let _ = tokio::fs::create_dir_all(&self.base_path).await;
         
@@ -434,7 +434,7 @@ impl<S: Storage + 'static> Database<S> {
         };
         
         let handle = self.storage.open(&path, options).await?;
-        self.storage.write(handle, 0, &json).await?;
+        self.storage.write(handle, 0, &data).await?;
         self.storage.sync(handle).await?;
         self.storage.close(handle).await?;
         
@@ -448,7 +448,7 @@ impl<S: Storage + 'static> Database<S> {
     }
     
     pub async fn load_collection(&self, name: &str) -> Result<(), StorageError> {
-        let path = format!("{}.json", name);
+        let path = format!("{}.bin", name);
         let options = OpenOptions {
             read: true,
             write: false,
@@ -466,7 +466,7 @@ impl<S: Storage + 'static> Database<S> {
         self.storage.read(handle, 0, &mut buf).await?;
         self.storage.close(handle).await?;
         
-        let records: Vec<RecordData> = serde_json::from_slice(&buf)
+        let records: Vec<RecordData> = bincode::deserialize(&buf)
             .map_err(|e| StorageError::WasmError(format!("Deserialization error: {}", e)))?;
         
         let mut collections = self.collections.write().await;
