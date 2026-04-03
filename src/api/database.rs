@@ -6,6 +6,7 @@ use crate::core::{VectorClock, LWWMap};
 use crate::storage::{Storage, error::StorageError, OpenOptions};
 use crate::graphql::{QueryRoot, MutationRoot, EventBus, Event, EventType};
 use crate::sync::{ChangeLog, ChangeEntry, Operation, SyncMessage};
+use crate::transaction::wal::{WriteAheadLog, WalEntry};
 use serde::{Serialize, Deserialize};
 
 pub struct Database<S: Storage + 'static> {
@@ -17,6 +18,7 @@ pub struct Database<S: Storage + 'static> {
     base_path: String,
     event_bus: EventBus,
     changelog: Arc<RwLock<ChangeLog>>,
+    pub(crate) wal: Arc<WriteAheadLog>,
 }
 
 pub(crate) struct Collection {
@@ -58,6 +60,7 @@ pub(crate) struct GraphqlDatabase {
     pub base_path: String,
     pub event_bus: EventBus,
     pub changelog: Arc<RwLock<ChangeLog>>,
+    pub wal: Arc<WriteAheadLog>,
 }
 
 impl GraphqlDatabase {
@@ -87,12 +90,21 @@ impl GraphqlDatabase {
     }
 
     pub async fn create_record(&self, collection: &str, data: serde_json::Value) -> Result<RecordData, StorageError> {
-        let mut collections = self.collections.write().await;
-        let col = collections.entry(collection.to_string())
-            .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id) });
-        
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis() as u64;
+        let txn_id = now;
+        
+        self.wal.append(&WalEntry::Begin { txn_id, timestamp: now }).await?;
+        
+        let data_bytes = bincode::serialize(&data)
+            .map_err(|e| StorageError::WasmError(e.to_string()))?;
+        
+        self.wal.append(&WalEntry::Insert {
+            txn_id,
+            collection: collection.to_string(),
+            key: id.clone(),
+            data: data_bytes,
+        }).await?;
         
         let mut clock = self.clock.write().await;
         clock.increment(&self.node_id);
@@ -109,8 +121,14 @@ impl GraphqlDatabase {
             },
         };
         
-        col.data.insert(id.clone(), record.clone());
-        drop(collections);
+        {
+            let mut collections = self.collections.write().await;
+            let col = collections.entry(collection.to_string())
+                .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id) });
+            col.data.insert(id.clone(), record.clone());
+        }
+        
+        self.wal.append(&WalEntry::Commit { txn_id }).await?;
         
         let mut changelog = self.changelog.write().await;
         changelog.add_entry(ChangeEntry {
@@ -129,7 +147,7 @@ impl GraphqlDatabase {
         let _ = self.event_bus.publish(Event {
             event_type: EventType::Created,
             collection: collection.to_string(),
-            record_id: id,
+            record_id: id.clone(),
             data: Some(record.fields.clone()),
         });
         
@@ -137,22 +155,37 @@ impl GraphqlDatabase {
     }
 
     pub async fn update_record(&self, collection: &str, id: &str, data: serde_json::Value) -> Result<Option<RecordData>, StorageError> {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let txn_id = now;
+        
+        self.wal.append(&WalEntry::Begin { txn_id, timestamp: now }).await?;
+        
+        let data_bytes = bincode::serialize(&data)
+            .map_err(|e| StorageError::WasmError(e.to_string()))?;
+        
+        self.wal.append(&WalEntry::Update {
+            txn_id,
+            collection: collection.to_string(),
+            key: id.to_string(),
+            data: data_bytes,
+        }).await?;
+        
+        let mut clock = self.clock.write().await;
+        clock.increment(&self.node_id);
+        let current_clock = clock.clone();
+        drop(clock);
+        
         let mut collections = self.collections.write().await;
         if let Some(col) = collections.get_mut(collection) {
             let id_string = id.to_string();
             if let Some(mut record) = col.data.get(&id_string).cloned() {
-                let now = chrono::Utc::now().timestamp_millis() as u64;
-                
-                let mut clock = self.clock.write().await;
-                clock.increment(&self.node_id);
-                let current_clock = clock.clone();
-                drop(clock);
-                
                 record.fields = data.clone();
                 record.meta.updated_at = now;
                 record.meta.clock = current_clock.clone();
                 col.data.insert(id_string, record.clone());
                 drop(collections);
+                
+                self.wal.append(&WalEntry::Commit { txn_id }).await?;
                 
                 let mut changelog = self.changelog.write().await;
                 changelog.add_entry(ChangeEntry {
@@ -177,20 +210,32 @@ impl GraphqlDatabase {
                 
                 Ok(Some(record))
             } else {
+                drop(collections);
                 Ok(None)
             }
         } else {
+            drop(collections);
             Ok(None)
         }
     }
 
     pub async fn delete_record(&self, collection: &str, id: &str) -> Result<bool, StorageError> {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let txn_id = now;
+        
+        self.wal.append(&WalEntry::Begin { txn_id, timestamp: now }).await?;
+        self.wal.append(&WalEntry::Delete {
+            txn_id,
+            collection: collection.to_string(),
+            key: id.to_string(),
+        }).await?;
+        
         let mut collections = self.collections.write().await;
         if let Some(col) = collections.get_mut(collection) {
             col.data.remove(id.to_string());
             drop(collections);
             
-            let now = chrono::Utc::now().timestamp_millis() as u64;
+            self.wal.append(&WalEntry::Commit { txn_id }).await?;
             
             let mut clock = self.clock.write().await;
             clock.increment(&self.node_id);
@@ -220,6 +265,7 @@ impl GraphqlDatabase {
             
             Ok(true)
         } else {
+            drop(collections);
             Ok(false)
         }
     }
@@ -268,8 +314,11 @@ impl GraphqlDatabase {
 
 impl<S: Storage + 'static> Database<S> {
     pub async fn open(storage: S, node_id: String, base_path: String) -> Result<Self, StorageError> {
+        let storage_arc = Arc::new(storage);
+        let wal = WriteAheadLog::new(storage_arc.clone(), &base_path).await?;
+        
         let mut db = Self {
-            storage: Arc::new(storage),
+            storage: storage_arc,
             collections: Arc::new(RwLock::new(HashMap::new())),
             node_id,
             clock: Arc::new(RwLock::new(VectorClock::new())),
@@ -277,6 +326,7 @@ impl<S: Storage + 'static> Database<S> {
             base_path,
             event_bus: EventBus::new(),
             changelog: Arc::new(RwLock::new(ChangeLog::new())),
+            wal: Arc::new(wal),
         };
         
         db.load_all().await?;
@@ -335,6 +385,7 @@ impl<S: Storage + 'static> Database<S> {
             base_path: self.base_path.clone(),
             event_bus: self.event_bus.clone(),
             changelog: self.changelog.clone(),
+            wal: self.wal.clone(),
         }
     }
 
