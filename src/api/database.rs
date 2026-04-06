@@ -19,6 +19,8 @@ const MAX_COLLECTION_NAME_LEN: usize = 128;
 const MAX_RECORD_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 /// Maximum pagination limit
 const MAX_FIRST: i32 = 1000;
+/// WAL checkpoint interval in seconds
+const CHECKPOINT_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 fn validate_collection_name(name: &str) -> Result<(), StorageError> {
     if name.is_empty() {
@@ -63,6 +65,7 @@ pub struct Database<S: Storage + 'static> {
     txn_manager: Arc<RwLock<Option<TransactionManager>>>,
     constraint_manager: Arc<RwLock<ConstraintManager>>,
     cached_schema: Arc<RwLock<Option<Schema<crate::graphql::QueryRoot, crate::graphql::MutationRoot, EmptySubscription>>>>,
+    _checkpoint_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) struct Collection {
@@ -434,16 +437,23 @@ impl GraphqlDatabase {
             }
         }
         col.indexes.insert(field.to_string(), index);
+        drop(collections);
+        self.save_metadata().await.ok();
         Ok(())
     }
 
     pub async fn drop_index(&self, collection: &str, field: &str) -> Result<bool, StorageError> {
         let mut collections = self.collections.write().await;
-        if let Some(col) = collections.get_mut(collection) {
-            Ok(col.indexes.remove(field).is_some())
+        let removed = if let Some(col) = collections.get_mut(collection) {
+            col.indexes.remove(field).is_some()
         } else {
-            Ok(false)
+            false
+        };
+        drop(collections);
+        if removed {
+            self.save_metadata().await.ok();
         }
+        Ok(removed)
     }
 
     pub async fn create_records(&self, collection: &str, items: Vec<serde_json::Value>) -> Result<Vec<RecordData>, StorageError> {
@@ -667,8 +677,67 @@ impl GraphqlDatabase {
 
     /// Gracefully flush all dirty pages to disk. Call before dropping the database.
     pub async fn shutdown(&self) -> Result<(), StorageError> {
+        self.save_metadata().await.ok();
         if let Some(engine) = &self.page_engine {
             engine.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Persist index definitions to disk.
+    async fn save_metadata(&self) -> Result<(), StorageError> {
+        let collections = self.collections.read().await;
+        let mut index_defs: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, col) in collections.iter() {
+            let fields: Vec<String> = col.indexes.keys().cloned().collect();
+            if !fields.is_empty() {
+                index_defs.insert(name.clone(), fields);
+            }
+        }
+        drop(collections);
+
+        let meta = serde_json::json!({ "indexes": index_defs });
+        let path = format!("{}/_metadata.json", self.base_path);
+        let bytes = serde_json::to_vec_pretty(&meta)
+            .map_err(|e| StorageError::WasmError(e.to_string()))?;
+
+        let options = OpenOptions { read: false, write: true, create: true, truncate: true };
+        let handle = self.storage.open(&path, options).await?;
+        self.storage.write(handle, 0, &bytes).await?;
+        self.storage.close(handle).await?;
+        Ok(())
+    }
+
+    /// Restore index definitions from disk.
+    pub async fn load_metadata(&self) -> Result<(), StorageError> {
+        let path = format!("{}/_metadata.json", self.base_path);
+        let options = OpenOptions { read: true, write: false, create: false, truncate: false };
+        let handle = match self.storage.open(&path, options).await {
+            Ok(h) => h,
+            Err(_) => return Ok(()), // No metadata file yet
+        };
+        let size = self.storage.size(handle).await?;
+        if size == 0 {
+            self.storage.close(handle).await?;
+            return Ok(());
+        }
+        let mut buf = vec![0u8; size as usize];
+        self.storage.read(handle, 0, &mut buf).await?;
+        self.storage.close(handle).await?;
+
+        let meta: serde_json::Value = serde_json::from_slice(&buf)
+            .map_err(|e| StorageError::WasmError(format!("Metadata parse error: {}", e)))?;
+
+        if let Some(indexes) = meta.get("indexes").and_then(|v| v.as_object()) {
+            for (collection, fields) in indexes {
+                if let Some(fields_arr) = fields.as_array() {
+                    for field in fields_arr {
+                        if let Some(field_str) = field.as_str() {
+                            self.create_index(collection, field_str).await?;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -718,16 +787,21 @@ impl<S: Storage + 'static> Database<S> {
             node_id,
             clock: Arc::new(RwLock::new(VectorClock::new())),
             relations: Arc::new(RwLock::new(HashMap::new())),
-            base_path,
+            base_path: base_path.clone(),
             event_bus: EventBus::new(),
             changelog: Arc::new(RwLock::new(ChangeLog::new())),
-            wal: wal_arc,
+            wal: wal_arc.clone(),
             txn_manager: Arc::new(RwLock::new(Some(txn_manager))),
             constraint_manager: Arc::new(RwLock::new(ConstraintManager::new())),
             cached_schema: Arc::new(RwLock::new(None)),
+            _checkpoint_handle: None,
         };
 
         db.load_all().await?;
+
+        // Restore index definitions from metadata
+        let gql_db = db.clone_for_graphql();
+        gql_db.load_metadata().await?;
 
         // Replay committed WAL entries on top of page data
         if !wal_entries.is_empty() {
@@ -735,6 +809,24 @@ impl<S: Storage + 'static> Database<S> {
             // Checkpoint: flush page engine and truncate WAL
             db.checkpoint().await?;
         }
+
+        // Spawn periodic WAL checkpoint task
+        let checkpoint_wal = db.wal.clone();
+        let checkpoint_engine = db.page_engine.clone();
+        db._checkpoint_handle = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(CHECKPOINT_INTERVAL_SECS)).await;
+                if let Some(engine) = &checkpoint_engine {
+                    if let Err(e) = engine.flush().await {
+                        eprintln!("Periodic checkpoint flush failed: {}", e);
+                        continue;
+                    }
+                }
+                if let Err(e) = checkpoint_wal.truncate().await {
+                    eprintln!("Periodic WAL truncate failed: {}", e);
+                }
+            }
+        }));
 
         Ok(db)
     }
@@ -982,7 +1074,10 @@ impl<S: Storage + 'static> Database<S> {
     }
 
     async fn checkpoint(&self) -> Result<(), StorageError> {
-        self.save().await?;
+        // Flush dirty buffer pool pages to disk
+        if let Some(engine) = &self.page_engine {
+            engine.flush().await?;
+        }
         self.wal.truncate().await?;
         Ok(())
     }
