@@ -13,6 +13,42 @@ use crate::transaction::{TransactionManager, Transaction, TransactionState, Oper
 use crate::constraints::{ConstraintManager, CollectionConstraints, ConstraintValidator};
 use serde::{Serialize, Deserialize};
 
+/// Maximum allowed collection name length
+const MAX_COLLECTION_NAME_LEN: usize = 128;
+/// Maximum allowed record data size in bytes (serialized)
+const MAX_RECORD_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
+/// Maximum pagination limit
+const MAX_FIRST: i32 = 1000;
+
+fn validate_collection_name(name: &str) -> Result<(), StorageError> {
+    if name.is_empty() {
+        return Err(StorageError::WasmError("Collection name cannot be empty".to_string()));
+    }
+    if name.len() > MAX_COLLECTION_NAME_LEN {
+        return Err(StorageError::WasmError(format!(
+            "Collection name exceeds {} bytes", MAX_COLLECTION_NAME_LEN
+        )));
+    }
+    // Only allow alphanumeric, underscore, and hyphen
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Err(StorageError::WasmError(
+            "Collection name can only contain alphanumeric characters, underscores, and hyphens".to_string()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_size(data: &serde_json::Value) -> Result<(), StorageError> {
+    let serialized = serde_json::to_vec(data)
+        .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+    if serialized.len() > MAX_RECORD_SIZE_BYTES {
+        return Err(StorageError::WasmError(format!(
+            "Record data exceeds {} bytes", MAX_RECORD_SIZE_BYTES
+        )));
+    }
+    Ok(())
+}
+
 pub struct Database<S: Storage + 'static> {
     storage: Arc<S>,
     page_engine: Option<PageStorageEngine>,
@@ -77,6 +113,7 @@ pub(crate) struct GraphqlDatabase {
 
 impl GraphqlDatabase {
     pub async fn get_records(&self, collection: &str) -> Result<Vec<(String, RecordData)>, StorageError> {
+        validate_collection_name(collection)?;
         let collections = self.collections.read().await;
         if let Some(col) = collections.get(collection) {
             let mut records = Vec::new();
@@ -128,6 +165,8 @@ impl GraphqlDatabase {
     }
 
     pub async fn create_record(&self, collection: &str, data: serde_json::Value) -> Result<RecordData, StorageError> {
+        validate_collection_name(collection)?;
+        validate_record_size(&data)?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis() as u64;
         
@@ -209,6 +248,8 @@ impl GraphqlDatabase {
     }
 
     pub async fn update_record(&self, collection: &str, id: &str, data: serde_json::Value) -> Result<Option<RecordData>, StorageError> {
+        validate_collection_name(collection)?;
+        validate_record_size(&data)?;
         let now = chrono::Utc::now().timestamp_millis() as u64;
         
         let cm = self.constraint_manager.read().await;
@@ -294,6 +335,7 @@ impl GraphqlDatabase {
     }
 
     pub async fn delete_record(&self, collection: &str, id: &str) -> Result<bool, StorageError> {
+        validate_collection_name(collection)?;
         let now = chrono::Utc::now().timestamp_millis() as u64;
         
         let mut tm = self.txn_manager.write().await;
@@ -405,6 +447,15 @@ impl GraphqlDatabase {
     }
 
     pub async fn create_records(&self, collection: &str, items: Vec<serde_json::Value>) -> Result<Vec<RecordData>, StorageError> {
+        validate_collection_name(collection)?;
+        if items.len() > MAX_FIRST as usize {
+            return Err(StorageError::WasmError(format!(
+                "Batch size exceeds {} records", MAX_FIRST
+            )));
+        }
+        for item in &items {
+            validate_record_size(item)?;
+        }
         let mut tm = self.txn_manager.write().await;
         if let Some(tm) = tm.as_mut() {
             let mut txn = tm.begin();
@@ -475,6 +526,7 @@ impl GraphqlDatabase {
     }
 
     pub async fn delete_records(&self, collection: &str, ids: Vec<String>) -> Result<i32, StorageError> {
+        validate_collection_name(collection)?;
         let mut tm = self.txn_manager.write().await;
         if let Some(tm) = tm.as_mut() {
             let mut txn = tm.begin();

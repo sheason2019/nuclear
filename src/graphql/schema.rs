@@ -57,6 +57,19 @@ impl QueryRoot {
         first: Option<i32>,
         offset: Option<i32>,
     ) -> Result<Vec<Record>> {
+        if let Some(first) = first {
+            if first < 0 {
+                return Err(Error::new("first must be non-negative"));
+            }
+            if first > 1000 {
+                return Err(Error::new("first cannot exceed 1000"));
+            }
+        }
+        if let Some(offset) = offset {
+            if offset < 0 {
+                return Err(Error::new("offset must be non-negative"));
+            }
+        }
         let db = ctx.data::<GraphqlDatabase>()?;
         let records = db.get_records(&collection).await
             .map_err(|e| Error::new(e.to_string()))?;
