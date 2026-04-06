@@ -191,7 +191,7 @@ impl GraphqlDatabase {
             });
             drop(changelog);
 
-            self.save_collection(collection).await?;
+            self.save_record(collection, &id, &record).await?;
 
             self.update_indexes_on_insert(collection, &id, &data).await;
 
@@ -265,8 +265,8 @@ impl GraphqlDatabase {
                         vector_clock: current_clock,
                     });
                     drop(changelog);
-                    
-                    self.save_collection(collection).await?;
+
+                    self.save_record(collection, &id_string, &record).await?;
 
                     self.update_indexes_on_update(collection, id, &old_fields, &data).await;
 
@@ -337,8 +337,8 @@ impl GraphqlDatabase {
                     vector_clock: current_clock,
                 });
                 drop(changelog);
-                
-                self.save_collection(collection).await?;
+
+                self.delete_record_from_storage(collection, id).await?;
 
                 if let Some(fields) = &old_fields {
                     self.update_indexes_on_delete(collection, id, fields).await;
@@ -465,7 +465,9 @@ impl GraphqlDatabase {
                 return Err(e);
             }
 
-            self.save_collection(collection).await?;
+            for record in &results {
+                self.save_record(collection, &record.meta.id, record).await?;
+            }
             Ok(results)
         } else {
             Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
@@ -513,10 +515,10 @@ impl GraphqlDatabase {
             drop(clock);
 
             for (id, record) in &deleted_records {
+                self.delete_record_from_storage(collection, id).await?;
                 self.update_indexes_on_delete(collection, id, &record.fields).await;
             }
 
-            self.save_collection(collection).await?;
             Ok(deleted_count)
         } else {
             Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
@@ -582,14 +584,31 @@ impl GraphqlDatabase {
             let collections = self.collections.read().await;
             if let Some(collection) = collections.get(name) {
                 engine.page_manager.initialize_collection(name).await?;
-                for key in collection.data.keys() {
-                    if let Some(record) = collection.data.get(key) {
-                        let value = bincode::serialize(record)
-                            .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
-                        engine.page_manager.insert(name, key.as_bytes(), &value).await?;
-                    }
+                for (key, record) in collection.data.iter() {
+                    let value = bincode::serialize(record)
+                        .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+                    engine.page_manager.insert(name, key.as_bytes(), &value).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Write a single record to the page engine (incremental, O(1)).
+    async fn save_record(&self, collection: &str, key: &str, record: &RecordData) -> Result<(), StorageError> {
+        if let Some(engine) = &self.page_engine {
+            engine.page_manager.initialize_collection(collection).await?;
+            let value = bincode::serialize(record)
+                .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+            engine.page_manager.insert(collection, key.as_bytes(), &value).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete a single record from the page engine (incremental, O(1)).
+    async fn delete_record_from_storage(&self, collection: &str, key: &str) -> Result<(), StorageError> {
+        if let Some(engine) = &self.page_engine {
+            engine.page_manager.delete(collection, key.as_bytes()).await?;
         }
         Ok(())
     }
@@ -955,42 +974,44 @@ impl<S: Storage + 'static> Database<S> {
                             clock: change.vector_clock.clone(),
                         },
                     };
-                    col.data.insert(change.record_id.clone(), record);
-                    
+                    col.data.insert(change.record_id.clone(), record.clone());
+
                     drop(collections);
-                    self.save_collection_by_name(&change.collection).await?;
+                    self.save_record_to_engine(&change.collection, &change.record_id, &record).await?;
                 }
             }
             SyncOperation::Delete => {
                 let mut collections = self.collections.write().await;
                 if let Some(col) = collections.get_mut(&change.collection) {
-                    col.data.remove(change.record_id);
+                    col.data.remove(change.record_id.clone());
                 }
                 drop(collections);
-                self.save_collection_by_name(&change.collection).await?;
+                self.delete_record_from_engine(&change.collection, &change.record_id).await?;
             }
         }
         
         Ok(())
     }
     
-    async fn save_collection_by_name(&self, name: &str) -> Result<(), StorageError> {
+    /// Incremental write of a single record to page engine (O(1)).
+    async fn save_record_to_engine(&self, collection: &str, key: &str, record: &RecordData) -> Result<(), StorageError> {
         if let Some(engine) = &self.page_engine {
-            let collections = self.collections.read().await;
-            if let Some(collection) = collections.get(name) {
-                engine.page_manager.initialize_collection(name).await?;
-                for key in collection.data.keys() {
-                    if let Some(record) = collection.data.get(key) {
-                        let value = bincode::serialize(record)
-                            .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
-                        engine.page_manager.insert(name, key.as_bytes(), &value).await?;
-                    }
-                }
-            }
+            engine.page_manager.initialize_collection(collection).await?;
+            let value = bincode::serialize(record)
+                .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+            engine.page_manager.insert(collection, key.as_bytes(), &value).await?;
         }
         Ok(())
     }
-    
+
+    /// Incremental delete of a single record from page engine (O(1)).
+    async fn delete_record_from_engine(&self, collection: &str, key: &str) -> Result<(), StorageError> {
+        if let Some(engine) = &self.page_engine {
+            engine.page_manager.delete(collection, key.as_bytes()).await?;
+        }
+        Ok(())
+    }
+
     pub async fn get_clock(&self) -> VectorClock {
         self.clock.read().await.clone()
     }
