@@ -21,6 +21,10 @@ const MAX_RECORD_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 const MAX_FIRST: i32 = 1000;
 /// WAL checkpoint interval in seconds
 const CHECKPOINT_INTERVAL_SECS: u64 = 300; // 5 minutes
+/// Maximum GraphQL query depth
+const MAX_QUERY_DEPTH: usize = 10;
+/// Maximum GraphQL query complexity (rough node count)
+const MAX_QUERY_COMPLEXITY: usize = 1000;
 
 fn validate_collection_name(name: &str) -> Result<(), StorageError> {
     if name.is_empty() {
@@ -48,6 +52,45 @@ fn validate_record_size(data: &serde_json::Value) -> Result<(), StorageError> {
             "Record data exceeds {} bytes", MAX_RECORD_SIZE_BYTES
         )));
     }
+    Ok(())
+}
+
+/// Basic query validation: length, depth (nested braces), and complexity (field count).
+fn validate_query(query: &str) -> Result<(), StorageError> {
+    // Query length limit (1MB)
+    if query.len() > 1024 * 1024 {
+        return Err(StorageError::WasmError("Query too large".to_string()));
+    }
+
+    // Depth check: count nested braces/parens
+    let mut max_depth = 0usize;
+    let mut current_depth = 0usize;
+    for ch in query.chars() {
+        match ch {
+            '{' | '(' => {
+                current_depth += 1;
+                max_depth = max_depth.max(current_depth);
+            }
+            '}' | ')' => {
+                current_depth = current_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    if max_depth > MAX_QUERY_DEPTH {
+        return Err(StorageError::WasmError(format!(
+            "Query depth {} exceeds maximum {}", max_depth, MAX_QUERY_DEPTH
+        )));
+    }
+
+    // Complexity: rough count of fields (whitespace-separated tokens)
+    let field_count = query.split_whitespace().count();
+    if field_count > MAX_QUERY_COMPLEXITY {
+        return Err(StorageError::WasmError(format!(
+            "Query complexity {} exceeds maximum {}", field_count, MAX_QUERY_COMPLEXITY
+        )));
+    }
+
     Ok(())
 }
 
@@ -854,6 +897,7 @@ impl<S: Storage + 'static> Database<S> {
     }
 
     pub async fn query(&self, query: &str) -> Result<serde_json::Value, StorageError> {
+        validate_query(query)?;
         let schema = self.get_or_build_schema().await;
         let result = schema.execute(query).await;
 
@@ -871,6 +915,7 @@ impl<S: Storage + 'static> Database<S> {
     }
 
     pub async fn mutation(&self, mutation: &str) -> Result<serde_json::Value, StorageError> {
+        validate_query(mutation)?;
         let schema = self.get_or_build_schema().await;
         let result = schema.execute(mutation).await;
 
