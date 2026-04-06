@@ -410,12 +410,12 @@ impl GraphqlDatabase {
             let mut txn = tm.begin();
             let mut results = Vec::new();
 
-            for data in items {
+            for mut data in items {
                 let id = uuid::Uuid::new_v4().to_string();
                 let now = chrono::Utc::now().timestamp_millis() as u64;
 
                 let cm = self.constraint_manager.read().await;
-                cm.apply_defaults(collection, &mut data.clone());
+                cm.apply_defaults(collection, &mut data);
                 cm.validate(collection, &data)?;
                 drop(cm);
 
@@ -611,6 +611,32 @@ impl GraphqlDatabase {
             engine.page_manager.delete(collection, key.as_bytes()).await?;
         }
         Ok(())
+    }
+
+    /// Gracefully flush all dirty pages to disk. Call before dropping the database.
+    pub async fn shutdown(&self) -> Result<(), StorageError> {
+        if let Some(engine) = &self.page_engine {
+            engine.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GraphqlDatabase {
+    fn drop(&mut self) {
+        if let Some(engine) = &self.page_engine {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let engine = engine.clone();
+                handle.spawn_blocking(move || {
+                    let rt = tokio::runtime::Runtime::new().ok();
+                    if let Some(rt) = rt {
+                        if let Err(e) = rt.block_on(engine.flush()) {
+                            eprintln!("Shutdown flush failed: {}", e);
+                        }
+                    }
+                });
+            }
+        }
     }
 }
 

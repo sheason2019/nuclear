@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 /// 页面大小，默认 4KB（与 SQLite 相同）
 pub const PAGE_SIZE: u64 = 4096;
+/// Checksum 长度 (CRC32 = 4 bytes)
+pub const CHECKSUM_SIZE: usize = 4;
 
 /// 文件头魔数
 pub const MAGIC_NUMBER: u32 = 0x4E55434C; // "NUCL"
@@ -34,7 +36,7 @@ impl Default for PageType {
 pub type PageNumber = u64;
 
 /// 页面头结构（固定 32 字节）
-/// 布局: [page_type:1][record_count:2][used_space:2][cell_content_start:2][cell_ptr_array_end:2][next_free_page:8][parent_page:8][reserved:7]
+/// 布局: [page_type:1][record_count:2][used_space:2][cell_content_start:2][cell_ptr_array_end:2][next_free_page:8][parent_page:8][checksum:4][reserved:3]
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct PageHeader {
@@ -45,7 +47,8 @@ pub struct PageHeader {
     pub cell_ptr_array_end: u16,
     pub next_free_page: PageNumber,
     pub parent_page: PageNumber,
-    pub reserved: [u8; 7],
+    checksum: [u8; CHECKSUM_SIZE],
+    reserved: [u8; 3],
 }
 
 impl Default for PageHeader {
@@ -58,7 +61,8 @@ impl Default for PageHeader {
             cell_ptr_array_end: 0, // 相对于 data 数组
             next_free_page: 0,
             parent_page: 0,
-            reserved: [0; 7],
+            checksum: [0; CHECKSUM_SIZE],
+            reserved: [0; 3],
         }
     }
 }
@@ -73,6 +77,8 @@ impl PageHeader {
         buf[7..9].copy_from_slice(&self.cell_ptr_array_end.to_le_bytes());
         buf[9..17].copy_from_slice(&self.next_free_page.to_le_bytes());
         buf[17..25].copy_from_slice(&self.parent_page.to_le_bytes());
+        buf[25..29].copy_from_slice(&self.checksum);
+        // bytes 29-32 reserved
         buf
     }
 
@@ -94,10 +100,30 @@ impl PageHeader {
             cell_ptr_array_end: u16::from_le_bytes([buf[7], buf[8]]),
             next_free_page: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
             parent_page: u64::from_le_bytes(buf[17..25].try_into().unwrap()),
-            reserved: buf[25..32]
-                .try_into()
-                .map_err(|_| "Invalid reserved bytes")?,
+            checksum: buf[25..29].try_into().map_err(|_| "Invalid checksum bytes")?,
+            reserved: buf[29..32].try_into().map_err(|_| "Invalid reserved bytes")?,
         })
+    }
+
+    /// Compute CRC32 checksum over header (without checksum) + page data.
+    pub fn compute_checksum(header_bytes: &[u8; 32], data: &[u8]) -> [u8; CHECKSUM_SIZE] {
+        let mut hasher = crc32fast::Hasher::new();
+        // Hash header bytes 0-24 and 29-31 (skip checksum field at 25-28)
+        hasher.update(&header_bytes[..25]);
+        hasher.update(&header_bytes[29..]);
+        hasher.update(data);
+        let crc = hasher.finalize();
+        crc.to_le_bytes()
+    }
+
+    /// Verify checksum of a page.
+    pub fn verify_checksum(&self, data: &[u8]) -> bool {
+        if self.checksum == [0; CHECKSUM_SIZE] {
+            return true; // No checksum computed yet (e.g. fresh page)
+        }
+        let header_bytes = self.to_bytes();
+        let expected = Self::compute_checksum(&header_bytes, data);
+        self.checksum == expected
     }
 
     /// 可用空间 = cell_content_start - cell_ptr_array_end
@@ -278,8 +304,14 @@ impl Page {
             return Err("Invalid page size");
         }
         let header = PageHeader::from_bytes(&data[..32])?;
-        // 只存储数据部分（跳过 PageHeader），to_bytes 会从偏移 32 写回
         let page_data = data[32..].to_vec();
+
+        // Page 0 contains the file header and has a dual-purpose layout;
+        // skip checksum verification for it.
+        if page_number != 0 && !header.verify_checksum(&page_data) {
+            return Err("Page checksum mismatch - possible data corruption");
+        }
+
         Ok(Self {
             page_number,
             header,
@@ -294,6 +326,9 @@ impl Page {
         result[..32].copy_from_slice(&header_bytes);
         // data 只包含 payload 部分，直接写入偏移 32 之后
         result[32..].copy_from_slice(&self.data);
+        // Compute and write checksum into the header region
+        let checksum = PageHeader::compute_checksum(&result[..32].try_into().unwrap(), &self.data);
+        result[25..29].copy_from_slice(&checksum);
         result
     }
 
@@ -448,7 +483,8 @@ mod tests {
             cell_ptr_array_end: 42,
             next_free_page: 0,
             parent_page: 0,
-            reserved: [0; 7],
+            checksum: [0; 4],
+            reserved: [0; 3],
         };
 
         let bytes = header.to_bytes();
@@ -637,5 +673,34 @@ mod tests {
         let restored = Page::from_bytes(1, &bytes).unwrap();
         assert_eq!(restored.header.record_count, 2);
         assert_eq!(restored.header.used_space, page.header.used_space);
+    }
+
+    #[test]
+    fn test_page_checksum_detects_corruption() {
+        let mut page = Page::new(1, PageType::Data);
+        page.write_record(b"key1", b"value1").unwrap();
+        page.write_record(b"key2", b"value2").unwrap();
+
+        let mut bytes = page.to_bytes();
+        // Corrupt a data byte
+        bytes[100] ^= 0xFF;
+        assert!(Page::from_bytes(1, &bytes).is_err());
+    }
+
+    #[test]
+    fn test_page_checksum_valid_roundtrip() {
+        let mut page = Page::new(5, PageType::Data);
+        page.write_record(b"hello", b"world").unwrap();
+
+        let bytes = page.to_bytes();
+        assert!(Page::from_bytes(5, &bytes).is_ok());
+    }
+
+    #[test]
+    fn test_page_checksum_fresh_page_skipped() {
+        let page = Page::new(1, PageType::Free);
+        // Fresh pages have all-zero checksum, verification is skipped
+        let bytes = page.to_bytes();
+        assert!(Page::from_bytes(1, &bytes).is_ok());
     }
 }
