@@ -237,8 +237,82 @@ impl ConstraintValidator {
         }
     }
 
-    pub fn check_unique(&self, _data: &serde_json::Value) -> Result<(), StorageError> {
+    /// Check uniqueness constraints and track values for a new record.
+    /// `exclude_id` is the record ID to exclude (for updates). Pass None for inserts.
+    pub fn check_unique(&mut self, data: &serde_json::Value, exclude_id: Option<&str>) -> Result<(), StorageError> {
+        let obj = data
+            .as_object()
+            .ok_or_else(|| StorageError::WasmError("Data must be a JSON object".to_string()))?;
+
+        for (field_name, field_def) in &self.constraints.fields {
+            let has_unique = field_def.constraints.iter().any(|c| matches!(c, FieldConstraint::Unique));
+            if !has_unique {
+                continue;
+            }
+
+            if let Some(value) = obj.get(field_name) {
+                let value_str = serde_json::to_string(value)
+                    .unwrap_or_default();
+
+                if let Some(existing) = self.unique_values.get(field_name) {
+                    if let Some(existing_id) = existing.get(&value_str) {
+                        // If updating the same record, allow it
+                        if exclude_id.map_or(true, |id| id != existing_id) {
+                            return Err(StorageError::WasmError(format!(
+                                "Unique constraint violated for field '{}': value {} already exists",
+                                field_name, value
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Register a value for uniqueness tracking.
+    pub fn register_unique(&mut self, record_id: &str, data: &serde_json::Value) {
+        let obj = match data.as_object() {
+            Some(o) => o,
+            None => return,
+        };
+
+        for (field_name, field_def) in &self.constraints.fields {
+            let has_unique = field_def.constraints.iter().any(|c| matches!(c, FieldConstraint::Unique));
+            if !has_unique {
+                continue;
+            }
+
+            if let Some(value) = obj.get(field_name) {
+                let value_str = serde_json::to_string(value).unwrap_or_default();
+                if let Some(map) = self.unique_values.get_mut(field_name) {
+                    map.insert(value_str, record_id.to_string());
+                }
+            }
+        }
+    }
+
+    /// Remove a record's values from uniqueness tracking.
+    pub fn unregister_unique(&mut self, data: &serde_json::Value) {
+        let obj = match data.as_object() {
+            Some(o) => o,
+            None => return,
+        };
+
+        for (field_name, field_def) in &self.constraints.fields {
+            let has_unique = field_def.constraints.iter().any(|c| matches!(c, FieldConstraint::Unique));
+            if !has_unique {
+                continue;
+            }
+
+            if let Some(value) = obj.get(field_name) {
+                let value_str = serde_json::to_string(value).unwrap_or_default();
+                if let Some(map) = self.unique_values.get_mut(field_name) {
+                    map.remove(&value_str);
+                }
+            }
+        }
     }
 
     pub fn constraints(&self) -> &CollectionConstraints {
@@ -368,14 +442,27 @@ impl ConstraintManager {
     }
 
     pub fn check_unique(
-        &self,
+        &mut self,
         collection: &str,
         data: &serde_json::Value,
+        exclude_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        if let Some(validator) = self.constraints.get(collection) {
-            validator.check_unique(data)
+        if let Some(validator) = self.constraints.get_mut(collection) {
+            validator.check_unique(data, exclude_id)
         } else {
             Ok(())
+        }
+    }
+
+    pub fn register_unique(&mut self, collection: &str, record_id: &str, data: &serde_json::Value) {
+        if let Some(validator) = self.constraints.get_mut(collection) {
+            validator.register_unique(record_id, data);
+        }
+    }
+
+    pub fn unregister_unique(&mut self, collection: &str, data: &serde_json::Value) {
+        if let Some(validator) = self.constraints.get_mut(collection) {
+            validator.unregister_unique(data);
         }
     }
 
@@ -523,5 +610,49 @@ mod tests {
         assert!(manager.validate("users", &invalid_data).is_err());
 
         assert!(manager.validate("posts", &serde_json::json!({})).is_ok());
+    }
+
+    #[test]
+    fn test_unique_constraint_rejects_duplicate() {
+        let mut manager = ConstraintManager::new();
+        manager.define_constraints("users", CollectionConstraints::new()
+            .field(FieldDef::new("email").unique()));
+
+        let data = serde_json::json!({ "email": "alice@example.com" });
+        assert!(manager.check_unique("users", &data, None).is_ok());
+        manager.register_unique("users", "id1", &data);
+
+        let data2 = serde_json::json!({ "email": "alice@example.com" });
+        assert!(manager.check_unique("users", &data2, None).is_err());
+
+        let data3 = serde_json::json!({ "email": "bob@example.com" });
+        assert!(manager.check_unique("users", &data3, None).is_ok());
+    }
+
+    #[test]
+    fn test_unique_constraint_allows_same_record_update() {
+        let mut manager = ConstraintManager::new();
+        manager.define_constraints("users", CollectionConstraints::new()
+            .field(FieldDef::new("email").unique()));
+
+        let data = serde_json::json!({ "email": "alice@example.com" });
+        manager.register_unique("users", "id1", &data);
+
+        // Updating the same record with same value should succeed
+        assert!(manager.check_unique("users", &data, Some("id1")).is_ok());
+    }
+
+    #[test]
+    fn test_unique_constraint_unregister() {
+        let mut manager = ConstraintManager::new();
+        manager.define_constraints("users", CollectionConstraints::new()
+            .field(FieldDef::new("email").unique()));
+
+        let data = serde_json::json!({ "email": "alice@example.com" });
+        manager.register_unique("users", "id1", &data);
+
+        manager.unregister_unique("users", &data);
+        // After unregister, same value should be allowed
+        assert!(manager.check_unique("users", &data, None).is_ok());
     }
 }

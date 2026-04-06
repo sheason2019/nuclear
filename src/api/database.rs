@@ -173,15 +173,16 @@ impl GraphqlDatabase {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis() as u64;
         
-        let cm = self.constraint_manager.read().await;
+        let mut cm = self.constraint_manager.write().await;
         let mut data = data;
         cm.apply_defaults(collection, &mut data);
         cm.validate(collection, &data)?;
+        cm.check_unique(collection, &data, None)?;
         drop(cm);
-        
+
         let data_bytes = bincode::serialize(&data)
             .map_err(|e| StorageError::WasmError(e.to_string()))?;
-        
+
         let mut tm = self.txn_manager.write().await;
         if let Some(tm) = tm.as_mut() {
             let mut txn = tm.begin();
@@ -220,6 +221,8 @@ impl GraphqlDatabase {
                 }
                 return Err(e);
             }
+
+            self.constraint_manager.write().await.register_unique(collection, &id, &data);
             
             let mut changelog = self.changelog.write().await;
             changelog.add_entry(ChangeEntry {
@@ -255,12 +258,13 @@ impl GraphqlDatabase {
         validate_record_size(&data)?;
         let now = chrono::Utc::now().timestamp_millis() as u64;
         
-        let cm = self.constraint_manager.read().await;
+        let mut cm = self.constraint_manager.write().await;
         let mut data = data;
         cm.apply_defaults(collection, &mut data);
         cm.validate(collection, &data)?;
+        cm.check_unique(collection, &data, Some(id))?;
         drop(cm);
-        
+
         let data_bytes = bincode::serialize(&data)
             .map_err(|e| StorageError::WasmError(e.to_string()))?;
         
@@ -313,6 +317,9 @@ impl GraphqlDatabase {
                     self.save_record(collection, &id_string, &record).await?;
 
                     self.update_indexes_on_update(collection, id, &old_fields, &data).await;
+
+                    self.constraint_manager.write().await.unregister_unique(collection, &old_fields);
+                    self.constraint_manager.write().await.register_unique(collection, id, &data);
 
                     let _ = self.event_bus.publish(Event {
                         event_type: EventType::Updated,
@@ -387,6 +394,7 @@ impl GraphqlDatabase {
 
                 if let Some(fields) = &old_fields {
                     self.update_indexes_on_delete(collection, id, fields).await;
+                    self.constraint_manager.write().await.unregister_unique(collection, fields);
                 }
 
                 let _ = self.event_bus.publish(Event {
@@ -475,9 +483,10 @@ impl GraphqlDatabase {
                 let id = uuid::Uuid::new_v4().to_string();
                 let now = chrono::Utc::now().timestamp_millis() as u64;
 
-                let cm = self.constraint_manager.read().await;
+                let mut cm = self.constraint_manager.write().await;
                 cm.apply_defaults(collection, &mut data);
                 cm.validate(collection, &data)?;
+                cm.check_unique(collection, &data, None)?;
                 drop(cm);
 
                 let data_bytes = bincode::serialize(&data)
@@ -528,6 +537,9 @@ impl GraphqlDatabase {
 
             for record in &results {
                 self.save_record(collection, &record.meta.id, record).await?;
+                self.constraint_manager.write().await.register_unique(
+                    collection, &record.meta.id, &record.fields,
+                );
             }
             Ok(results)
         } else {
@@ -579,6 +591,7 @@ impl GraphqlDatabase {
             for (id, record) in &deleted_records {
                 self.delete_record_from_storage(collection, id).await?;
                 self.update_indexes_on_delete(collection, id, &record.fields).await;
+                self.constraint_manager.write().await.unregister_unique(collection, &record.fields);
             }
 
             Ok(deleted_count)
