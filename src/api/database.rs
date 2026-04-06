@@ -4,13 +4,16 @@ use tokio::sync::RwLock;
 use async_graphql::{Schema, EmptySubscription};
 use crate::core::{VectorClock, LWWMap};
 use crate::storage::{Storage, error::StorageError, OpenOptions};
+use crate::storage::{PageStorageEngine, BufferPoolConfig};
 use crate::graphql::{QueryRoot, MutationRoot, EventBus, Event, EventType};
-use crate::sync::{ChangeLog, ChangeEntry, Operation, SyncMessage};
-use crate::transaction::wal::{WriteAheadLog, WalEntry};
+use crate::sync::{ChangeLog, ChangeEntry, Operation as SyncOperation, SyncMessage};
+use crate::transaction::wal::WriteAheadLog;
+use crate::transaction::{TransactionManager, Transaction, TransactionState, Operation as TxnOperation};
 use serde::{Serialize, Deserialize};
 
 pub struct Database<S: Storage + 'static> {
     storage: Arc<S>,
+    page_engine: Option<PageStorageEngine>,
     pub(crate) collections: Arc<RwLock<HashMap<String, Collection>>>,
     node_id: String,
     pub(crate) clock: Arc<RwLock<VectorClock>>,
@@ -19,6 +22,7 @@ pub struct Database<S: Storage + 'static> {
     event_bus: EventBus,
     changelog: Arc<RwLock<ChangeLog>>,
     pub(crate) wal: Arc<WriteAheadLog>,
+    txn_manager: Arc<RwLock<Option<TransactionManager>>>,
 }
 
 pub(crate) struct Collection {
@@ -61,6 +65,7 @@ pub(crate) struct GraphqlDatabase {
     pub event_bus: EventBus,
     pub changelog: Arc<RwLock<ChangeLog>>,
     pub wal: Arc<WriteAheadLog>,
+    pub txn_manager: Arc<RwLock<Option<TransactionManager>>>,
 }
 
 impl GraphqlDatabase {
@@ -89,167 +94,86 @@ impl GraphqlDatabase {
         }
     }
 
+    pub async fn begin_transaction(&self) -> Result<u64, StorageError> {
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            let txn = tm.begin();
+            Ok(txn.id)
+        } else {
+            Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
+        }
+    }
+
+    pub async fn commit_transaction(&self, txn_id: u64) -> Result<(), StorageError> {
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            tm.commit_by_id(txn_id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn rollback_transaction(&self, txn_id: u64) -> Result<(), StorageError> {
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            tm.rollback_by_id(txn_id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn create_record(&self, collection: &str, data: serde_json::Value) -> Result<RecordData, StorageError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        let txn_id = now;
-        
-        self.wal.append(&WalEntry::Begin { txn_id, timestamp: now }).await?;
         
         let data_bytes = bincode::serialize(&data)
             .map_err(|e| StorageError::WasmError(e.to_string()))?;
         
-        self.wal.append(&WalEntry::Insert {
-            txn_id,
-            collection: collection.to_string(),
-            key: id.clone(),
-            data: data_bytes,
-        }).await?;
-        
-        let mut clock = self.clock.write().await;
-        clock.increment(&self.node_id);
-        let current_clock = clock.clone();
-        drop(clock);
-        
-        let record = RecordData {
-            fields: data.clone(),
-            meta: RecordMeta {
-                id: id.clone(),
-                created_at: now,
-                updated_at: now,
-                clock: current_clock.clone(),
-            },
-        };
-        
-        {
-            let mut collections = self.collections.write().await;
-            let col = collections.entry(collection.to_string())
-                .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id) });
-            col.data.insert(id.clone(), record.clone());
-        }
-        
-        self.wal.append(&WalEntry::Commit { txn_id }).await?;
-        
-        let mut changelog = self.changelog.write().await;
-        changelog.add_entry(ChangeEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
-            collection: collection.to_string(),
-            record_id: id.clone(),
-            operation: Operation::Create,
-            data: Some(data),
-            vector_clock: current_clock,
-        });
-        drop(changelog);
-        
-        self.save_collection(collection).await?;
-        
-        let _ = self.event_bus.publish(Event {
-            event_type: EventType::Created,
-            collection: collection.to_string(),
-            record_id: id.clone(),
-            data: Some(record.fields.clone()),
-        });
-        
-        Ok(record)
-    }
-
-    pub async fn update_record(&self, collection: &str, id: &str, data: serde_json::Value) -> Result<Option<RecordData>, StorageError> {
-        let now = chrono::Utc::now().timestamp_millis() as u64;
-        let txn_id = now;
-        
-        self.wal.append(&WalEntry::Begin { txn_id, timestamp: now }).await?;
-        
-        let data_bytes = bincode::serialize(&data)
-            .map_err(|e| StorageError::WasmError(e.to_string()))?;
-        
-        self.wal.append(&WalEntry::Update {
-            txn_id,
-            collection: collection.to_string(),
-            key: id.to_string(),
-            data: data_bytes,
-        }).await?;
-        
-        let mut clock = self.clock.write().await;
-        clock.increment(&self.node_id);
-        let current_clock = clock.clone();
-        drop(clock);
-        
-        let mut collections = self.collections.write().await;
-        if let Some(col) = collections.get_mut(collection) {
-            let id_string = id.to_string();
-            if let Some(mut record) = col.data.get(&id_string).cloned() {
-                record.fields = data.clone();
-                record.meta.updated_at = now;
-                record.meta.clock = current_clock.clone();
-                col.data.insert(id_string, record.clone());
-                drop(collections);
-                
-                self.wal.append(&WalEntry::Commit { txn_id }).await?;
-                
-                let mut changelog = self.changelog.write().await;
-                changelog.add_entry(ChangeEntry {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now,
-                    collection: collection.to_string(),
-                    record_id: id.to_string(),
-                    operation: Operation::Update,
-                    data: Some(data),
-                    vector_clock: current_clock,
-                });
-                drop(changelog);
-                
-                self.save_collection(collection).await?;
-                
-                let _ = self.event_bus.publish(Event {
-                    event_type: EventType::Updated,
-                    collection: collection.to_string(),
-                    record_id: id.to_string(),
-                    data: Some(record.fields.clone()),
-                });
-                
-                Ok(Some(record))
-            } else {
-                drop(collections);
-                Ok(None)
-            }
-        } else {
-            drop(collections);
-            Ok(None)
-        }
-    }
-
-    pub async fn delete_record(&self, collection: &str, id: &str) -> Result<bool, StorageError> {
-        let now = chrono::Utc::now().timestamp_millis() as u64;
-        let txn_id = now;
-        
-        self.wal.append(&WalEntry::Begin { txn_id, timestamp: now }).await?;
-        self.wal.append(&WalEntry::Delete {
-            txn_id,
-            collection: collection.to_string(),
-            key: id.to_string(),
-        }).await?;
-        
-        let mut collections = self.collections.write().await;
-        if let Some(col) = collections.get_mut(collection) {
-            col.data.remove(id.to_string());
-            drop(collections);
-            
-            self.wal.append(&WalEntry::Commit { txn_id }).await?;
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            let mut txn = tm.begin();
+            txn.operations.push(TxnOperation::Insert {
+                collection: collection.to_string(),
+                key: id.clone(),
+                data: data_bytes.clone(),
+            });
             
             let mut clock = self.clock.write().await;
             clock.increment(&self.node_id);
             let current_clock = clock.clone();
             drop(clock);
             
+            let record = RecordData {
+                fields: data.clone(),
+                meta: RecordMeta {
+                    id: id.clone(),
+                    created_at: now,
+                    updated_at: now,
+                    clock: current_clock.clone(),
+                },
+            };
+            
+            {
+                let mut collections = self.collections.write().await;
+                let col = collections.entry(collection.to_string())
+                    .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id) });
+                col.data.insert(id.clone(), record.clone());
+            }
+            
+            if let Err(e) = tm.commit(&mut txn).await {
+                let mut collections = self.collections.write().await;
+                if let Some(col) = collections.get_mut(collection) {
+                    col.data.remove(id);
+                }
+                return Err(e);
+            }
+            
             let mut changelog = self.changelog.write().await;
             changelog.add_entry(ChangeEntry {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: now,
                 collection: collection.to_string(),
-                record_id: id.to_string(),
-                operation: Operation::Delete,
-                data: None,
+                record_id: id.clone(),
+                operation: SyncOperation::Create,
+                data: Some(data),
                 vector_clock: current_clock,
             });
             drop(changelog);
@@ -257,16 +181,155 @@ impl GraphqlDatabase {
             self.save_collection(collection).await?;
             
             let _ = self.event_bus.publish(Event {
-                event_type: EventType::Deleted,
+                event_type: EventType::Created,
                 collection: collection.to_string(),
-                record_id: id.to_string(),
-                data: None,
+                record_id: id.clone(),
+                data: Some(record.fields.clone()),
             });
             
-            Ok(true)
+            Ok(record)
         } else {
-            drop(collections);
-            Ok(false)
+            Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
+        }
+    }
+
+    pub async fn update_record(&self, collection: &str, id: &str, data: serde_json::Value) -> Result<Option<RecordData>, StorageError> {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        
+        let data_bytes = bincode::serialize(&data)
+            .map_err(|e| StorageError::WasmError(e.to_string()))?;
+        
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            let mut txn = tm.begin();
+            txn.operations.push(TxnOperation::Update {
+                collection: collection.to_string(),
+                key: id.to_string(),
+                data: data_bytes.clone(),
+            });
+            
+            let mut clock = self.clock.write().await;
+            clock.increment(&self.node_id);
+            let current_clock = clock.clone();
+            drop(clock);
+            
+            let mut collections = self.collections.write().await;
+            if let Some(col) = collections.get_mut(collection) {
+                let id_string = id.to_string();
+                if let Some(mut record) = col.data.get(&id_string).cloned() {
+                    let old_record = record.clone();
+                    record.fields = data.clone();
+                    record.meta.updated_at = now;
+                    record.meta.clock = current_clock.clone();
+                    col.data.insert(id_string.clone(), record.clone());
+                    drop(collections);
+                    
+                    if let Err(e) = tm.commit(&mut txn).await {
+                        let mut collections = self.collections.write().await;
+                        if let Some(col) = collections.get_mut(collection) {
+                            col.data.insert(id_string, old_record);
+                        }
+                        return Err(e);
+                    }
+                    
+                    let mut changelog = self.changelog.write().await;
+                    changelog.add_entry(ChangeEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        timestamp: now,
+                        collection: collection.to_string(),
+                        record_id: id.to_string(),
+                        operation: SyncOperation::Update,
+                        data: Some(data),
+                        vector_clock: current_clock,
+                    });
+                    drop(changelog);
+                    
+                    self.save_collection(collection).await?;
+                    
+                    let _ = self.event_bus.publish(Event {
+                        event_type: EventType::Updated,
+                        collection: collection.to_string(),
+                        record_id: id.to_string(),
+                        data: Some(record.fields.clone()),
+                    });
+                    
+                    Ok(Some(record))
+                } else {
+                    drop(collections);
+                    let _ = tm.rollback(&mut txn).await;
+                    Ok(None)
+                }
+            } else {
+                drop(collections);
+                let _ = tm.rollback(&mut txn).await;
+                Ok(None)
+            }
+        } else {
+            Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
+        }
+    }
+
+    pub async fn delete_record(&self, collection: &str, id: &str) -> Result<bool, StorageError> {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            let mut txn = tm.begin();
+            txn.operations.push(TxnOperation::Delete {
+                collection: collection.to_string(),
+                key: id.to_string(),
+            });
+            
+            let mut collections = self.collections.write().await;
+            if let Some(col) = collections.get_mut(collection) {
+                let old_record = col.data.get(&id.to_string()).cloned();
+                col.data.remove(id.to_string());
+                drop(collections);
+                
+                if let Err(e) = tm.commit(&mut txn).await {
+                    if let Some(record) = old_record {
+                        let mut collections = self.collections.write().await;
+                        if let Some(col) = collections.get_mut(collection) {
+                            col.data.insert(id.to_string(), record);
+                        }
+                    }
+                    return Err(e);
+                }
+                
+                let mut clock = self.clock.write().await;
+                clock.increment(&self.node_id);
+                let current_clock = clock.clone();
+                drop(clock);
+                
+                let mut changelog = self.changelog.write().await;
+                changelog.add_entry(ChangeEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now,
+                    collection: collection.to_string(),
+                    record_id: id.to_string(),
+                    operation: SyncOperation::Delete,
+                    data: None,
+                    vector_clock: current_clock,
+                });
+                drop(changelog);
+                
+                self.save_collection(collection).await?;
+                
+                let _ = self.event_bus.publish(Event {
+                    event_type: EventType::Deleted,
+                    collection: collection.to_string(),
+                    record_id: id.to_string(),
+                    data: None,
+                });
+                
+                Ok(true)
+            } else {
+                drop(collections);
+                let _ = tm.rollback(&mut txn).await;
+                Ok(false)
+            }
+        } else {
+            Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
         }
     }
 
@@ -316,9 +379,21 @@ impl<S: Storage + 'static> Database<S> {
     pub async fn open(storage: S, node_id: String, base_path: String) -> Result<Self, StorageError> {
         let storage_arc = Arc::new(storage);
         let wal = WriteAheadLog::new(storage_arc.clone(), &base_path).await?;
+        let wal_arc = Arc::new(wal);
+        
+        let db_file = format!("{}/nuclear.db", base_path);
+        let _ = tokio::fs::create_dir_all(&base_path).await;
+        let page_engine = PageStorageEngine::new(
+            storage_arc.clone(),
+            &db_file,
+            BufferPoolConfig::default(),
+        ).await?;
+        
+        let txn_manager = TransactionManager::new((*wal_arc).clone()).await?;
         
         let mut db = Self {
             storage: storage_arc,
+            page_engine: Some(page_engine),
             collections: Arc::new(RwLock::new(HashMap::new())),
             node_id,
             clock: Arc::new(RwLock::new(VectorClock::new())),
@@ -326,7 +401,8 @@ impl<S: Storage + 'static> Database<S> {
             base_path,
             event_bus: EventBus::new(),
             changelog: Arc::new(RwLock::new(ChangeLog::new())),
-            wal: Arc::new(wal),
+            wal: wal_arc,
+            txn_manager: Arc::new(RwLock::new(Some(txn_manager))),
         };
         
         db.load_all().await?;
@@ -386,6 +462,7 @@ impl<S: Storage + 'static> Database<S> {
             event_bus: self.event_bus.clone(),
             changelog: self.changelog.clone(),
             wal: self.wal.clone(),
+            txn_manager: self.txn_manager.clone(),
         }
     }
 
@@ -455,40 +532,34 @@ impl<S: Storage + 'static> Database<S> {
     }
     
     pub async fn save(&self) -> Result<(), StorageError> {
-        let collections = self.collections.read().await;
-        for (name, collection) in collections.iter() {
-            self.save_collection(name, collection).await?;
+        if let Some(engine) = &self.page_engine {
+            let collections = self.collections.read().await;
+            for (name, collection) in collections.iter() {
+                engine.page_manager.initialize_collection(name).await?;
+                for key in collection.data.keys() {
+                    if let Some(record) = collection.data.get(key) {
+                        let value = bincode::serialize(record)
+                            .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+                        engine.page_manager.insert(name, key.as_bytes(), &value).await?;
+                    }
+                }
+            }
+            engine.flush().await?;
         }
         Ok(())
     }
     
     async fn save_collection(&self, name: &str, collection: &Collection) -> Result<(), StorageError> {
-        let mut records = Vec::new();
-        for key in collection.data.keys() {
-            if let Some(record) = collection.data.get(key) {
-                records.push(record.clone());
+        if let Some(engine) = &self.page_engine {
+            engine.page_manager.initialize_collection(name).await?;
+            for key in collection.data.keys() {
+                if let Some(record) = collection.data.get(key) {
+                    let value = bincode::serialize(record)
+                        .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+                    engine.page_manager.insert(name, key.as_bytes(), &value).await?;
+                }
             }
         }
-        
-        let data = bincode::serialize(&records)
-            .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
-        
-        let path = format!("{}.bin", name);
-        
-        let _ = tokio::fs::create_dir_all(&self.base_path).await;
-        
-        let options = OpenOptions {
-            read: false,
-            write: true,
-            create: true,
-            truncate: true,
-        };
-        
-        let handle = self.storage.open(&path, options).await?;
-        self.storage.write(handle, 0, &data).await?;
-        self.storage.sync(handle).await?;
-        self.storage.close(handle).await?;
-        
         Ok(())
     }
     
@@ -573,7 +644,7 @@ impl<S: Storage + 'static> Database<S> {
         drop(changelog);
         
         match change.operation {
-            Operation::Create | Operation::Update => {
+            SyncOperation::Create | SyncOperation::Update => {
                 if let Some(data) = change.data {
                     let mut collections = self.collections.write().await;
                     let col = collections.entry(change.collection.clone())
@@ -603,7 +674,7 @@ impl<S: Storage + 'static> Database<S> {
                     self.save_collection_by_name(&change.collection).await?;
                 }
             }
-            Operation::Delete => {
+            SyncOperation::Delete => {
                 let mut collections = self.collections.write().await;
                 if let Some(col) = collections.get_mut(&change.collection) {
                     col.data.remove(change.record_id);
@@ -617,9 +688,18 @@ impl<S: Storage + 'static> Database<S> {
     }
     
     async fn save_collection_by_name(&self, name: &str) -> Result<(), StorageError> {
-        let collections = self.collections.read().await;
-        if let Some(collection) = collections.get(name) {
-            self.save_collection(name, collection).await?;
+        if let Some(engine) = &self.page_engine {
+            let collections = self.collections.read().await;
+            if let Some(collection) = collections.get(name) {
+                engine.page_manager.initialize_collection(name).await?;
+                for key in collection.data.keys() {
+                    if let Some(record) = collection.data.get(key) {
+                        let value = bincode::serialize(record)
+                            .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+                        engine.page_manager.insert(name, key.as_bytes(), &value).await?;
+                    }
+                }
+            }
         }
         Ok(())
     }

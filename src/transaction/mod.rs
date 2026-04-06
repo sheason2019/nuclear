@@ -133,6 +133,34 @@ impl TransactionManager {
         Ok(())
     }
 
+    pub fn get_transaction(&self, txn_id: u64) -> Option<&Transaction> {
+        self.active_transactions.get(&txn_id)
+    }
+
+    pub fn get_transaction_mut(&mut self, txn_id: u64) -> Option<&mut Transaction> {
+        self.active_transactions.get_mut(&txn_id)
+    }
+
+    pub fn remove_transaction(&mut self, txn_id: u64) -> Option<Transaction> {
+        self.active_transactions.remove(&txn_id)
+    }
+
+    pub async fn commit_by_id(&mut self, txn_id: u64) -> Result<(), StorageError> {
+        let txn = self.active_transactions.remove(&txn_id)
+            .ok_or_else(|| StorageError::WasmError("Transaction not found".to_string()))?;
+        
+        let mut txn = txn;
+        self.commit(&mut txn).await
+    }
+
+    pub async fn rollback_by_id(&mut self, txn_id: u64) -> Result<(), StorageError> {
+        let txn = self.active_transactions.remove(&txn_id)
+            .ok_or_else(|| StorageError::WasmError("Transaction not found".to_string()))?;
+        
+        let mut txn = txn;
+        self.rollback(&mut txn).await
+    }
+
     async fn recover(&mut self) -> Result<(), StorageError> {
         let entries = self.wal.read_all().await?;
         
