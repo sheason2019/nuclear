@@ -9,6 +9,7 @@ use crate::graphql::{QueryRoot, MutationRoot, EventBus, Event, EventType};
 use crate::sync::{ChangeLog, ChangeEntry, Operation as SyncOperation, SyncMessage};
 use crate::transaction::wal::WriteAheadLog;
 use crate::transaction::{TransactionManager, Transaction, TransactionState, Operation as TxnOperation};
+use crate::constraints::{ConstraintManager, CollectionConstraints, ConstraintValidator};
 use serde::{Serialize, Deserialize};
 
 pub struct Database<S: Storage + 'static> {
@@ -23,6 +24,7 @@ pub struct Database<S: Storage + 'static> {
     changelog: Arc<RwLock<ChangeLog>>,
     pub(crate) wal: Arc<WriteAheadLog>,
     txn_manager: Arc<RwLock<Option<TransactionManager>>>,
+    constraint_manager: Arc<RwLock<ConstraintManager>>,
 }
 
 pub(crate) struct Collection {
@@ -66,6 +68,7 @@ pub(crate) struct GraphqlDatabase {
     pub changelog: Arc<RwLock<ChangeLog>>,
     pub wal: Arc<WriteAheadLog>,
     pub txn_manager: Arc<RwLock<Option<TransactionManager>>>,
+    pub constraint_manager: Arc<RwLock<ConstraintManager>>,
 }
 
 impl GraphqlDatabase {
@@ -123,6 +126,12 @@ impl GraphqlDatabase {
     pub async fn create_record(&self, collection: &str, data: serde_json::Value) -> Result<RecordData, StorageError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis() as u64;
+        
+        let cm = self.constraint_manager.read().await;
+        let mut data = data;
+        cm.apply_defaults(collection, &mut data);
+        cm.validate(collection, &data)?;
+        drop(cm);
         
         let data_bytes = bincode::serialize(&data)
             .map_err(|e| StorageError::WasmError(e.to_string()))?;
@@ -195,6 +204,12 @@ impl GraphqlDatabase {
 
     pub async fn update_record(&self, collection: &str, id: &str, data: serde_json::Value) -> Result<Option<RecordData>, StorageError> {
         let now = chrono::Utc::now().timestamp_millis() as u64;
+        
+        let cm = self.constraint_manager.read().await;
+        let mut data = data;
+        cm.apply_defaults(collection, &mut data);
+        cm.validate(collection, &data)?;
+        drop(cm);
         
         let data_bytes = bincode::serialize(&data)
             .map_err(|e| StorageError::WasmError(e.to_string()))?;
@@ -403,6 +418,7 @@ impl<S: Storage + 'static> Database<S> {
             changelog: Arc::new(RwLock::new(ChangeLog::new())),
             wal: wal_arc,
             txn_manager: Arc::new(RwLock::new(Some(txn_manager))),
+            constraint_manager: Arc::new(RwLock::new(ConstraintManager::new())),
         };
         
         db.load_all().await?;
@@ -463,6 +479,7 @@ impl<S: Storage + 'static> Database<S> {
             changelog: self.changelog.clone(),
             wal: self.wal.clone(),
             txn_manager: self.txn_manager.clone(),
+            constraint_manager: self.constraint_manager.clone(),
         }
     }
 
@@ -485,6 +502,12 @@ impl<S: Storage + 'static> Database<S> {
             foreign_key: foreign_key.to_string(),
             local_key: local_key.to_string(),
         });
+        Ok(())
+    }
+
+    pub async fn define_constraints(&self, collection: &str, constraints: CollectionConstraints) -> Result<(), StorageError> {
+        let mut cm = self.constraint_manager.write().await;
+        cm.define_constraints(collection, constraints);
         Ok(())
     }
 
