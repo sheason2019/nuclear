@@ -13,7 +13,7 @@ pub enum FilterOp {
 }
 
 pub struct Filter {
-    conditions: std::collections::HashMap<String, FilterOp>,
+    conditions: std::collections::HashMap<String, Vec<FilterOp>>,
 }
 
 impl Filter {
@@ -22,8 +22,8 @@ impl Filter {
         let mut conditions = std::collections::HashMap::new();
 
         for (field, value) in obj {
-            if let Some(op) = Self::parse_filter_op(value) {
-                conditions.insert(field.clone(), op);
+            if let Some(ops) = Self::parse_filter_ops(value) {
+                conditions.insert(field.clone(), ops);
             }
         }
 
@@ -34,81 +34,87 @@ impl Filter {
         }
     }
 
-    fn parse_filter_op(value: &Value) -> Option<FilterOp> {
+    fn parse_filter_ops(value: &Value) -> Option<Vec<FilterOp>> {
         let obj = value.as_object()?;
+        if obj.is_empty() {
+            return None;
+        }
+        let mut ops = Vec::new();
 
         for (op_name, op_value) in obj {
             match op_name.as_str() {
-                "eq" => return Some(FilterOp::Eq(op_value.clone())),
-                "ne" => return Some(FilterOp::Ne(op_value.clone())),
-                "gt" => return Some(FilterOp::Gt(op_value.clone())),
-                "gte" => return Some(FilterOp::Gte(op_value.clone())),
-                "lt" => return Some(FilterOp::Lt(op_value.clone())),
-                "lte" => return Some(FilterOp::Lte(op_value.clone())),
+                "eq" => ops.push(FilterOp::Eq(op_value.clone())),
+                "ne" => ops.push(FilterOp::Ne(op_value.clone())),
+                "gt" => ops.push(FilterOp::Gt(op_value.clone())),
+                "gte" => ops.push(FilterOp::Gte(op_value.clone())),
+                "lt" => ops.push(FilterOp::Lt(op_value.clone())),
+                "lte" => ops.push(FilterOp::Lte(op_value.clone())),
                 "contains" => {
                     if let Some(s) = op_value.as_str() {
-                        return Some(FilterOp::Contains(s.to_string()));
+                        ops.push(FilterOp::Contains(s.to_string()));
                     }
                 }
                 "in" => {
                     if let Some(arr) = op_value.as_array() {
-                        return Some(FilterOp::In(arr.clone()));
+                        ops.push(FilterOp::In(arr.clone()));
                     }
                 }
                 _ => {}
             }
         }
 
-        None
+        if ops.is_empty() { None } else { Some(ops) }
     }
 
     pub fn matches(&self, data: &Value) -> bool {
-        for (field, op) in &self.conditions {
+        for (field, ops) in &self.conditions {
             let field_value = data.get(field);
 
-            match op {
-                FilterOp::Eq(expected) => {
-                    if field_value != Some(expected) {
-                        return false;
-                    }
-                }
-                FilterOp::Ne(expected) => {
-                    if field_value == Some(expected) {
-                        return false;
-                    }
-                }
-                FilterOp::Gt(expected) => {
-                    if !Self::compare_gt(field_value, expected) {
-                        return false;
-                    }
-                }
-                FilterOp::Gte(expected) => {
-                    if !Self::compare_gte(field_value, expected) {
-                        return false;
-                    }
-                }
-                FilterOp::Lt(expected) => {
-                    if !Self::compare_lt(field_value, expected) {
-                        return false;
-                    }
-                }
-                FilterOp::Lte(expected) => {
-                    if !Self::compare_lte(field_value, expected) {
-                        return false;
-                    }
-                }
-                FilterOp::Contains(substr) => {
-                    if let Some(s) = field_value.and_then(|v| v.as_str()) {
-                        if !s.contains(substr) {
+            for op in ops {
+                match op {
+                    FilterOp::Eq(expected) => {
+                        if field_value != Some(expected) {
                             return false;
                         }
-                    } else {
-                        return false;
                     }
-                }
-                FilterOp::In(values) => {
-                    if !values.contains(field_value.unwrap_or(&Value::Null)) {
-                        return false;
+                    FilterOp::Ne(expected) => {
+                        if field_value == Some(expected) {
+                            return false;
+                        }
+                    }
+                    FilterOp::Gt(expected) => {
+                        if !Self::compare_gt(field_value, expected) {
+                            return false;
+                        }
+                    }
+                    FilterOp::Gte(expected) => {
+                        if !Self::compare_gte(field_value, expected) {
+                            return false;
+                        }
+                    }
+                    FilterOp::Lt(expected) => {
+                        if !Self::compare_lt(field_value, expected) {
+                            return false;
+                        }
+                    }
+                    FilterOp::Lte(expected) => {
+                        if !Self::compare_lte(field_value, expected) {
+                            return false;
+                        }
+                    }
+                    FilterOp::Contains(substr) => {
+                        if let Some(s) = field_value.and_then(|v| v.as_str()) {
+                            if !s.contains(substr) {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    FilterOp::In(values) => {
+                        if !values.contains(field_value.unwrap_or(&Value::Null)) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -348,6 +354,22 @@ mod filter_tests {
         let filter = Filter::from_json(&filter_json).unwrap();
         let data = json!({"name": "Alice", "age": 25});
         assert!(filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_range_excludes_upper() {
+        let filter_json = json!({"age": {"gte": 20, "lte": 30}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Bob", "age": 35});
+        assert!(!filter.matches(&data));
+    }
+
+    #[test]
+    fn test_filter_range_excludes_lower() {
+        let filter_json = json!({"age": {"gte": 20, "lte": 30}});
+        let filter = Filter::from_json(&filter_json).unwrap();
+        let data = json!({"name": "Charlie", "age": 15});
+        assert!(!filter.matches(&data));
     }
 
     #[test]

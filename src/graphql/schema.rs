@@ -205,13 +205,72 @@ impl MutationRoot {
     }
 
     async fn delete_record(
-        &self, 
+        &self,
         ctx: &Context<'_>,
         collection: String,
         id: ID
     ) -> Result<bool> {
         let db = ctx.data::<GraphqlDatabase>()?;
         db.delete_record(&collection, &id).await
+            .map_err(|e| Error::new(e.to_string()))
+    }
+
+    async fn create_index(
+        &self,
+        ctx: &Context<'_>,
+        collection: String,
+        field: String,
+    ) -> Result<bool> {
+        let db = ctx.data::<GraphqlDatabase>()?;
+        db.create_index(&collection, &field).await
+            .map_err(|e| Error::new(e.to_string()))?;
+        Ok(true)
+    }
+
+    async fn drop_index(
+        &self,
+        ctx: &Context<'_>,
+        collection: String,
+        field: String,
+    ) -> Result<bool> {
+        let db = ctx.data::<GraphqlDatabase>()?;
+        db.drop_index(&collection, &field).await
+            .map_err(|e| Error::new(e.to_string()))
+    }
+
+    async fn create_records(
+        &self,
+        ctx: &Context<'_>,
+        collection: String,
+        data: Vec<Json>,
+    ) -> Result<Vec<Record>> {
+        let db = ctx.data::<GraphqlDatabase>()?;
+        let items: Vec<serde_json::Value> = data.into_iter().map(|j| j.0).collect();
+        let records = db.create_records(&collection, items).await
+            .map_err(|e| Error::new(e.to_string()))?;
+        Ok(records.into_iter().map(|rd| Record {
+            data: rd.fields,
+            meta: Meta {
+                id: rd.meta.id.into(),
+                created_at: DateTime(chrono::DateTime::from_timestamp_millis(rd.meta.created_at as i64)
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Utc)),
+                updated_at: DateTime(chrono::DateTime::from_timestamp_millis(rd.meta.updated_at as i64)
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Utc)),
+            },
+        }).collect())
+    }
+
+    async fn delete_records(
+        &self,
+        ctx: &Context<'_>,
+        collection: String,
+        ids: Vec<ID>,
+    ) -> Result<i32> {
+        let db = ctx.data::<GraphqlDatabase>()?;
+        let id_strs: Vec<String> = ids.into_iter().map(|id| id.to_string()).collect();
+        db.delete_records(&collection, id_strs).await
             .map_err(|e| Error::new(e.to_string()))
     }
 }

@@ -117,6 +117,15 @@ where
         entry.set(Some(value));
     }
 
+    /// Insert with a specific timestamp (for restoring from persistence).
+    pub fn insert_with_timestamp(&mut self, key: K, value: V, timestamp: u64, node_id: &str) {
+        let entry = self
+            .entries
+            .entry(key)
+            .or_insert_with(|| LWWRegister::new(&self.node_id));
+        entry.set_with_timestamp(Some(value), timestamp, node_id.to_string());
+    }
+
     pub fn get(&self, key: &K) -> Option<&V> {
         self.entries
             .get(key)
@@ -149,6 +158,13 @@ where
         self.entries
             .values()
             .filter_map(|reg| reg.get().and_then(|v| v.as_ref()))
+    }
+
+    /// Iterate over non-tombstone entries as (&K, &V).
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries
+            .iter()
+            .filter_map(|(k, reg)| reg.get().and_then(|v| v.as_ref()).map(|v| (k, v)))
     }
 }
 

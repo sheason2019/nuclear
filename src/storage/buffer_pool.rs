@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::page::{Page, PageNumber, PageType, PAGE_SIZE};
+use super::page::{FileHeader, Page, PageNumber, PageType, PAGE_SIZE};
 use super::{Storage, OpenOptions, StorageError};
 
 /// 缓冲池配置
@@ -142,7 +142,7 @@ impl BufferPool {
             storage,
             file_path: file_path.to_string(),
             initialized: false,
-            next_page_number: 1, // Page 0 is reserved for file header
+            next_page_number: 2, // Page 0 = file header, Page 1 = metadata
         }
     }
 
@@ -159,17 +159,43 @@ impl BufferPool {
         let size = self.storage.size(handle).await?;
 
         if size == 0 {
-            // 新文件，写入文件头页面
+            // 新文件：写入文件头页面 + FileHeader
             let header_page = Page::new(0, PageType::Data);
-            let bytes = header_page.to_bytes();
-            self.storage.write(handle, 0, &bytes).await?;
+            let file_header = FileHeader::default();
+            let header_bytes = file_header.to_bytes();
+            let page_bytes = header_page.to_bytes();
+            self.storage.write(handle, 0, &page_bytes).await?;
+            // FileHeader 位于文件偏移 32 处
+            self.storage.write(handle, 32, &header_bytes).await?;
+            // 预分配元数据页面（page 1），标记为 Data 防止被 find_free_page 回收
+            let meta_page = Page::new(1, PageType::Data);
+            let meta_bytes = meta_page.to_bytes();
+            self.storage.write(handle, 1 * PAGE_SIZE, &meta_bytes).await?;
             self.storage.sync(handle).await?;
+            self.next_page_number = file_header.next_page_number;
+        } else {
+            // 已有文件：从 FileHeader 恢复 next_page_number
+            let mut buf = vec![0u8; 160];
+            let _ = self.storage.read(handle, 0, &mut buf).await;
+            if let Ok(file_header) = FileHeader::from_bytes(&buf[32..160]) {
+                self.next_page_number = file_header.next_page_number;
+            }
         }
 
         self.storage.close(handle).await?;
         self.initialized = true;
 
         Ok(())
+    }
+
+    /// 获取当前 next_page_number（只读）
+    pub fn next_page_number(&self) -> PageNumber {
+        self.next_page_number
+    }
+
+    /// 获取 storage 引用和 file_path（供 PageManager 直接文件操作使用）
+    pub fn storage_and_path(&self) -> (&Arc<dyn Storage>, &str) {
+        (&self.storage, &self.file_path)
     }
 
     /// 获取页面（如果不在缓存中则从磁盘加载）
@@ -398,7 +424,7 @@ pub struct BufferPoolStats {
 
 /// 线程安全的缓冲池包装器
 pub struct SharedBufferPool {
-    inner: Arc<RwLock<BufferPool>>,
+    pub(super) inner: Arc<RwLock<BufferPool>>,
 }
 
 impl SharedBufferPool {
@@ -432,6 +458,51 @@ impl SharedBufferPool {
         self.inner.write().await.flush().await
     }
 
+    pub async fn next_page_number(&self) -> PageNumber {
+        self.inner.read().await.next_page_number()
+    }
+
+    /// 将当前 next_page_number 写入文件头（直接操作文件，绕过 Page 缓存）
+    pub async fn sync_file_header(&self) -> Result<(), StorageError> {
+        let mut pool = self.inner.write().await;
+        let file_header = FileHeader::with_next_page_number(pool.next_page_number);
+        let header_bytes = file_header.to_bytes();
+        let (storage, file_path) = (pool.storage.clone(), pool.file_path.clone());
+        drop(pool);
+        let options = OpenOptions {
+            read: false,
+            write: true,
+            create: false,
+            truncate: false,
+        };
+        let handle = storage.open(&file_path, options).await?;
+        storage.write(handle, 32, &header_bytes).await?;
+        storage.sync(handle).await?;
+        storage.close(handle).await?;
+        Ok(())
+    }
+
+    /// 读取文件头（直接操作文件，绕过 Page 缓存）
+    pub async fn read_file_header(&self) -> Result<Option<FileHeader>, StorageError> {
+        let pool = self.inner.read().await;
+        let (storage, file_path) = (pool.storage.clone(), pool.file_path.clone());
+        drop(pool);
+        let options = OpenOptions {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+        };
+        let handle = storage.open(&file_path, options).await?;
+        let mut buf = vec![0u8; 160];
+        let bytes_read = storage.read(handle, 0, &mut buf).await?;
+        storage.close(handle).await?;
+        if bytes_read < 160 {
+            return Ok(None);
+        }
+        Ok(FileHeader::from_bytes(&buf[32..160]).ok())
+    }
+
     pub async fn flush_page(&self, page_number: PageNumber) -> Result<(), StorageError> {
         self.inner.write().await.flush_page(page_number).await
     }
@@ -441,7 +512,9 @@ impl SharedBufferPool {
         let page_number = page.page_number;
         pool.pages.insert(page_number, page);
         pool.lru.move_to_front(page_number);
-        pool.write_page_to_disk(page_number).await
+        // Mark dirty — actual write happens on flush() or eviction
+        pool.mark_dirty(page_number);
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -496,7 +569,7 @@ mod tests {
         pool.initialize().await.unwrap();
 
         let page_number = pool.allocate_page(PageType::Data).await.unwrap();
-        assert_eq!(page_number, 1); // Page 0 is reserved for file header
+        assert_eq!(page_number, 2); // Page 0 = file header, Page 1 = metadata (pre-allocated)
 
         let page = pool.get_page(page_number).await.unwrap();
         assert_eq!(page.header.page_type, PageType::Data);

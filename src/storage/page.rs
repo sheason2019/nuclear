@@ -54,8 +54,8 @@ impl Default for PageHeader {
             page_type: PageType::Free,
             record_count: 0,
             used_space: 0,
-            cell_content_start: PAGE_SIZE as u16,
-            cell_ptr_array_end: PAGE_HEADER_SIZE,
+            cell_content_start: (PAGE_SIZE - PAGE_HEADER_SIZE as u64) as u16, // 相对于 data 数组
+            cell_ptr_array_end: 0, // 相对于 data 数组
             next_free_page: 0,
             parent_page: 0,
             reserved: [0; 7],
@@ -145,6 +145,11 @@ impl RecordHeader {
 }
 
 /// 数据库文件头
+///
+/// 布局 (128 bytes):
+/// [magic:4][version:4][page_size:4][total_pages:8][first_free_page:8]
+/// [free_page_count:8][data_page_count:8][next_page_number:8][metadata_page:8]
+/// [reserved:68]
 #[derive(Debug, Clone)]
 pub struct FileHeader {
     pub magic: u32,
@@ -154,7 +159,11 @@ pub struct FileHeader {
     pub first_free_page: PageNumber,
     pub free_page_count: PageNumber,
     pub data_page_count: PageNumber,
-    pub reserved: [u8; 48],
+    /// 下一个可分配的页面号（由 BufferPool 维护）
+    pub next_page_number: PageNumber,
+    /// 元数据页面号（存储集合-页面映射）
+    pub metadata_page: PageNumber,
+    reserved: [u8; 68],
 }
 
 impl Default for FileHeader {
@@ -167,12 +176,22 @@ impl Default for FileHeader {
             first_free_page: 0,
             free_page_count: 0,
             data_page_count: 0,
-            reserved: [0; 48],
+            next_page_number: 2, // page 0 = header, page 1 = metadata
+            metadata_page: 1,
+            reserved: [0; 68],
         }
     }
 }
 
 impl FileHeader {
+    /// 创建一个仅更新指定字段的 FileHeader（用于 sync_file_header）
+    pub fn with_next_page_number(next_page_number: PageNumber) -> Self {
+        Self {
+            next_page_number,
+            ..Default::default()
+        }
+    }
+
     pub fn to_bytes(&self) -> [u8; 128] {
         let mut buf = [0u8; 128];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -182,6 +201,8 @@ impl FileHeader {
         buf[20..28].copy_from_slice(&self.first_free_page.to_le_bytes());
         buf[28..36].copy_from_slice(&self.free_page_count.to_le_bytes());
         buf[36..44].copy_from_slice(&self.data_page_count.to_le_bytes());
+        buf[44..52].copy_from_slice(&self.next_page_number.to_le_bytes());
+        buf[52..60].copy_from_slice(&self.metadata_page.to_le_bytes());
         buf
     }
 
@@ -201,7 +222,9 @@ impl FileHeader {
             first_free_page: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
             free_page_count: u64::from_le_bytes(buf[28..36].try_into().unwrap()),
             data_page_count: u64::from_le_bytes(buf[36..44].try_into().unwrap()),
-            reserved: buf[44..92].try_into().unwrap(),
+            next_page_number: u64::from_le_bytes(buf[44..52].try_into().unwrap()),
+            metadata_page: u64::from_le_bytes(buf[52..60].try_into().unwrap()),
+            reserved: buf[60..128].try_into().unwrap(),
         })
     }
 
@@ -236,15 +259,16 @@ pub struct Page {
 
 impl Page {
     pub fn new(page_number: PageNumber, page_type: PageType) -> Self {
+        let data_len = (PAGE_SIZE - PAGE_HEADER_SIZE as u64) as usize;
         Self {
             page_number,
             header: PageHeader {
                 page_type,
-                cell_content_start: PAGE_SIZE as u16,
-                cell_ptr_array_end: PAGE_HEADER_SIZE,
+                cell_content_start: data_len as u16,
+                cell_ptr_array_end: 0,
                 ..Default::default()
             },
-            data: vec![0u8; PAGE_SIZE as usize],
+            data: vec![0u8; data_len],
             is_dirty: true,
         }
     }
@@ -254,10 +278,12 @@ impl Page {
             return Err("Invalid page size");
         }
         let header = PageHeader::from_bytes(&data[..32])?;
+        // 只存储数据部分（跳过 PageHeader），to_bytes 会从偏移 32 写回
+        let page_data = data[32..].to_vec();
         Ok(Self {
             page_number,
             header,
-            data: data.to_vec(),
+            data: page_data,
             is_dirty: false,
         })
     }
@@ -266,7 +292,8 @@ impl Page {
         let mut result = vec![0u8; PAGE_SIZE as usize];
         let header_bytes = self.header.to_bytes();
         result[..32].copy_from_slice(&header_bytes);
-        result[32..].copy_from_slice(&self.data[..(PAGE_SIZE as usize - 32)]);
+        // data 只包含 payload 部分，直接写入偏移 32 之后
+        result[32..].copy_from_slice(&self.data);
         result
     }
 
@@ -322,7 +349,7 @@ impl Page {
         if cell_index >= self.header.record_count {
             return Err("Cell index out of range");
         }
-        let ptr_pos = PAGE_HEADER_SIZE as usize + (cell_index * CELL_POINTER_SIZE) as usize;
+        let ptr_pos = (cell_index * CELL_POINTER_SIZE) as usize;
         Ok(u16::from_le_bytes(
             self.data[ptr_pos..ptr_pos + 2].try_into().unwrap(),
         ))
@@ -462,7 +489,9 @@ mod tests {
             first_free_page: 5,
             free_page_count: 10,
             data_page_count: 89,
-            reserved: [0; 48],
+            next_page_number: 50,
+            metadata_page: 1,
+            reserved: [0; 68],
         };
 
         let bytes = header.to_bytes();
@@ -471,6 +500,8 @@ mod tests {
         assert_eq!(restored.total_pages, 100);
         assert_eq!(restored.first_free_page, 5);
         assert_eq!(restored.free_page_count, 10);
+        assert_eq!(restored.next_page_number, 50);
+        assert_eq!(restored.metadata_page, 1);
     }
 
     #[test]
@@ -490,7 +521,7 @@ mod tests {
         let page = Page::new(1, PageType::Data);
         assert_eq!(page.page_number, 1);
         assert_eq!(page.header.page_type, PageType::Data);
-        assert_eq!(page.data.len(), PAGE_SIZE as usize);
+        assert_eq!(page.data.len(), (PAGE_SIZE - PAGE_HEADER_SIZE as u64) as usize);
         assert!(page.is_dirty);
     }
 

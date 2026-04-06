@@ -25,6 +25,12 @@ impl<T: Clone + Default> LWWRegister<T> {
             .as_millis() as u64;
     }
 
+    pub fn set_with_timestamp(&mut self, value: T, timestamp: u64, node_id: String) {
+        self.value = value;
+        self.timestamp = timestamp;
+        self.node_id = node_id;
+    }
+
     pub fn get(&self) -> Option<&T> {
         if self.timestamp == 0 {
             None

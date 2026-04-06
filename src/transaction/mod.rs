@@ -163,10 +163,10 @@ impl TransactionManager {
 
     async fn recover(&mut self) -> Result<(), StorageError> {
         let entries = self.wal.read_all().await?;
-        
+
         let mut committed_txns: HashMap<u64, Vec<WalEntry>> = HashMap::new();
         let mut uncommitted_txns: HashMap<u64, Vec<WalEntry>> = HashMap::new();
-        
+
         for entry in entries {
             let txn_id = match &entry {
                 WalEntry::Begin { txn_id, .. } => *txn_id,
@@ -176,7 +176,7 @@ impl TransactionManager {
                 WalEntry::Commit { txn_id } => *txn_id,
                 WalEntry::Rollback { txn_id } => *txn_id,
             };
-            
+
             if matches!(&entry, WalEntry::Commit { .. }) {
                 if let Some(ops) = uncommitted_txns.remove(&txn_id) {
                     committed_txns.insert(txn_id, ops);
@@ -187,10 +187,10 @@ impl TransactionManager {
                 uncommitted_txns.entry(txn_id).or_default().push(entry);
             }
         }
-        
+
         if !uncommitted_txns.is_empty() {
             self.wal.truncate().await?;
-            
+
             for (txn_id, entries) in &committed_txns {
                 for entry in entries {
                     self.wal.append(entry).await?;
@@ -198,8 +198,53 @@ impl TransactionManager {
                 self.wal.append(&WalEntry::Commit { txn_id: *txn_id }).await?;
             }
         }
-        
+
         Ok(())
+    }
+
+    /// Return all committed WAL entries (for replay on startup).
+    /// Called after recover() has already cleaned up uncommitted transactions.
+    pub async fn get_committed_entries(&self) -> Result<Vec<WalEntry>, StorageError> {
+        let entries = self.wal.read_all().await?;
+
+        let mut committed_txns: HashMap<u64, Vec<WalEntry>> = HashMap::new();
+        let mut current_txn_ops: Option<Vec<WalEntry>> = None;
+
+        for entry in entries {
+            let txn_id = match &entry {
+                WalEntry::Begin { txn_id, .. } => *txn_id,
+                WalEntry::Insert { txn_id, .. } => *txn_id,
+                WalEntry::Update { txn_id, .. } => *txn_id,
+                WalEntry::Delete { txn_id, .. } => *txn_id,
+                WalEntry::Commit { txn_id } => *txn_id,
+                WalEntry::Rollback { txn_id } => *txn_id,
+            };
+
+            match &entry {
+                WalEntry::Begin { .. } => {
+                    current_txn_ops = Some(Vec::new());
+                }
+                WalEntry::Commit { .. } => {
+                    if let Some(ops) = current_txn_ops.take() {
+                        committed_txns.insert(txn_id, ops);
+                    }
+                }
+                WalEntry::Rollback { .. } => {
+                    current_txn_ops = None;
+                }
+                _ => {
+                    if let Some(ops) = &mut current_txn_ops {
+                        ops.push(entry);
+                    }
+                }
+            }
+        }
+
+        let mut all_ops = Vec::new();
+        for (_, ops) in committed_txns {
+            all_ops.extend(ops);
+        }
+        Ok(all_ops)
     }
 }
 

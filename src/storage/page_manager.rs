@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::page::{Page, PageNumber, PageType};
+use super::page::{FileHeader, Page, PageHeader, PageNumber, PageType, PAGE_SIZE, PAGE_HEADER_SIZE, CELL_POINTER_SIZE};
 use super::buffer_pool::{BufferPoolConfig, SharedBufferPool};
 use super::{Storage, StorageError};
 
@@ -19,10 +20,19 @@ pub struct Record {
     pub deleted: bool,
 }
 
+/// 元数据序列化结构
+#[derive(Serialize, Deserialize)]
+struct CollectionMetadata {
+    collection_roots: HashMap<String, PageNumber>,
+    collection_pages: HashMap<String, Vec<PageNumber>>,
+}
+
 pub struct PageManager {
     buffer_pool: SharedBufferPool,
     collection_roots: HashMap<String, PageNumber>,
     collection_pages: HashMap<String, Vec<PageNumber>>,
+    /// 文件是否已初始化（防止重复加载元数据）
+    metadata_loaded: bool,
 }
 
 impl PageManager {
@@ -31,7 +41,106 @@ impl PageManager {
             buffer_pool,
             collection_roots: HashMap::new(),
             collection_pages: HashMap::new(),
+            metadata_loaded: false,
         }
+    }
+
+    /// 尝试从元数据页面加载集合映射（仅在首次调用时执行）
+    pub async fn load_metadata_if_needed(&mut self) -> Result<(), StorageError> {
+        if self.metadata_loaded {
+            return Ok(());
+        }
+        self.metadata_loaded = true;
+
+        // 读取 FileHeader 获取 metadata_page 编号（直接从文件读取）
+        let file_header = self.buffer_pool.read_file_header().await
+            .map_err(|e| StorageError::WasmError(format!("Failed to read file header: {}", e)))?;
+
+        let metadata_page = match file_header {
+            Some(h) => h.metadata_page,
+            None => return Ok(()), // 新文件，无 FileHeader
+        };
+
+        // 直接从文件读取元数据（绕过 Page 缓存，避免 Page.data 双用途问题）
+        let (storage, file_path) = {
+            let pool = self.buffer_pool.inner.read().await;
+            (pool.storage_and_path().0.clone(), pool.storage_and_path().1.to_string())
+        };
+        let options = super::OpenOptions {
+            read: true, write: false, create: false, truncate: false,
+        };
+        let handle = storage.open(&file_path, options).await
+            .map_err(|e| StorageError::WasmError(format!("Failed to open file: {}", e)))?;
+        let offset = metadata_page * PAGE_SIZE + 32;
+        let mut buf = vec![0u8; PAGE_SIZE as usize - 32];
+        let bytes_read = storage.read(handle, offset, &mut buf).await
+            .map_err(|e| StorageError::WasmError(format!("Failed to read metadata: {}", e)))?;
+        storage.close(handle).await
+            .map_err(|e| StorageError::WasmError(format!("Failed to close file: {}", e)))?;
+
+        if bytes_read < 4 {
+            return Ok(());
+        }
+
+        let meta_len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        if meta_len == 0 || 4 + meta_len > bytes_read {
+            return Ok(());
+        }
+
+        let metadata: CollectionMetadata = bincode::deserialize(&buf[4..4 + meta_len]).map_err(|e| StorageError::WasmError(format!("Failed to deserialize metadata: {}", e)))?;
+
+        self.collection_roots = metadata.collection_roots;
+        self.collection_pages = metadata.collection_pages;
+
+        Ok(())
+    }
+
+    /// 将集合映射持久化到元数据页面（直接写文件，绕过 Page 缓存）
+    /// 格式：[meta_len: 4 bytes LE][bincode: meta_len bytes]，从文件偏移 page*4096+32 开始
+    async fn save_metadata(&mut self) -> Result<(), StorageError> {
+        let metadata = CollectionMetadata {
+            collection_roots: self.collection_roots.clone(),
+            collection_pages: self.collection_pages.clone(),
+        };
+
+        let meta_data = bincode::serialize(&metadata)
+            .map_err(|e| StorageError::WasmError(format!("Failed to serialize metadata: {}", e)))?;
+
+        let file_header = self.buffer_pool.read_file_header().await
+            .map_err(|e| StorageError::WasmError(format!("Failed to read file header: {}", e)))?;
+
+        let metadata_page = match file_header {
+            Some(h) => h.metadata_page,
+            None => return Ok(()),
+        };
+
+        // 直接写入文件：metadata_page * PAGE_SIZE + 32
+        let mut buf = vec![0u8; PAGE_SIZE as usize - 32];
+        let meta_len = meta_data.len() as u32;
+        buf[..4].copy_from_slice(&meta_len.to_le_bytes());
+        buf[4..4 + meta_data.len()].copy_from_slice(&meta_data);
+
+        let (storage, file_path) = {
+            let pool = self.buffer_pool.inner.read().await;
+            (pool.storage_and_path().0.clone(), pool.storage_and_path().1.to_string())
+        };
+        let options = super::OpenOptions {
+            read: false,
+            write: true,
+            create: false,
+            truncate: false,
+        };
+        let handle = storage.open(&file_path, options).await
+            .map_err(|e| StorageError::WasmError(format!("Failed to open file: {}", e)))?;
+        let offset = metadata_page * PAGE_SIZE + 32;
+        storage.write(handle, offset, &buf).await
+            .map_err(|e| StorageError::WasmError(format!("Failed to write metadata: {}", e)))?;
+        storage.sync(handle).await
+            .map_err(|e| StorageError::WasmError(format!("Failed to sync metadata: {}", e)))?;
+        storage.close(handle).await
+            .map_err(|e| StorageError::WasmError(format!("Failed to close file: {}", e)))?;
+
+        Ok(())
     }
 
     pub async fn initialize_collection(&mut self, collection: &str) -> Result<(), StorageError> {
@@ -41,7 +150,9 @@ impl PageManager {
         let root_page = self.buffer_pool.allocate_page(PageType::Data).await?;
         self.collection_roots.insert(collection.to_string(), root_page);
         self.collection_pages.insert(collection.to_string(), vec![root_page]);
-        Ok(())
+        // 同步 FileHeader
+        self.buffer_pool.sync_file_header().await?;
+        self.save_metadata().await
     }
 
     pub async fn insert(&mut self, collection: &str, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
@@ -157,6 +268,9 @@ impl PageManager {
         if let Some(pages) = self.collection_pages.get_mut(collection) {
             pages.push(new_page);
         }
+        // 同步 FileHeader 并保存元数据
+        self.buffer_pool.sync_file_header().await?;
+        self.save_metadata().await?;
         Ok(new_page)
     }
 }
@@ -170,6 +284,11 @@ impl SharedPageManager {
         Self {
             inner: Arc::new(RwLock::new(PageManager::new(buffer_pool))),
         }
+    }
+
+    /// 加载元数据（启动时调用）
+    pub async fn load_metadata(&self) -> Result<(), StorageError> {
+        self.inner.write().await.load_metadata_if_needed().await
     }
 
     pub async fn initialize_collection(&self, collection: &str) -> Result<(), StorageError> {
@@ -199,6 +318,11 @@ impl SharedPageManager {
     pub async fn flush(&self) -> Result<(), StorageError> {
         self.inner.read().await.flush().await
     }
+
+    /// 获取所有集合名称
+    pub async fn collection_names(&self) -> Vec<String> {
+        self.inner.read().await.collection_roots.keys().cloned().collect()
+    }
 }
 
 impl Clone for SharedPageManager {
@@ -223,6 +347,8 @@ impl PageStorageEngine {
         let buffer_pool = SharedBufferPool::new(storage, file_path, config);
         buffer_pool.initialize().await?;
         let page_manager = SharedPageManager::new(buffer_pool.clone());
+        // 从元数据页面恢复集合映射
+        page_manager.load_metadata().await?;
         Ok(Self {
             buffer_pool,
             page_manager,
@@ -362,5 +488,71 @@ mod tests {
         let stats = engine.stats().await;
         assert!(stats.cached_pages > 0);
         assert!(stats.dirty_pages > 0);
+    }
+
+    #[tokio::test]
+    async fn test_page_manager_metadata_persists_across_restart() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        // 写入数据到两个集合
+        {
+            let storage: Arc<dyn Storage> = Arc::new(WasiStorage::new(dir.path()));
+            let config = BufferPoolConfig { max_pages: 10, ..Default::default() };
+            let engine = PageStorageEngine::new(storage, &file_path, config).await.unwrap();
+            engine.page_manager.insert("users", b"user1", b"Alice").await.unwrap();
+            engine.page_manager.insert("posts", b"post1", b"Hello").await.unwrap();
+            engine.flush().await.unwrap();
+        }
+
+        // 重新打开，验证集合映射已恢复
+        {
+            let storage: Arc<dyn Storage> = Arc::new(WasiStorage::new(dir.path()));
+            let config = BufferPoolConfig { max_pages: 10, ..Default::default() };
+            let engine = PageStorageEngine::new(storage, &file_path, config).await.unwrap();
+
+            let names = engine.page_manager.collection_names().await;
+            assert!(names.contains(&"users".to_string()));
+            assert!(names.contains(&"posts".to_string()));
+
+            let record = engine.page_manager.get("users", b"user1").await.unwrap();
+            assert!(record.is_some());
+            assert_eq!(record.unwrap().value, b"Alice");
+
+            let record = engine.page_manager.get("posts", b"post1").await.unwrap();
+            assert!(record.is_some());
+            assert_eq!(record.unwrap().value, b"Hello");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffer_pool_next_page_number_survives_restart() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.db").to_string_lossy().to_string();
+
+        // 分配多个页面
+        {
+            let storage: Arc<dyn Storage> = Arc::new(WasiStorage::new(dir.path()));
+            let config = BufferPoolConfig { max_pages: 10, ..Default::default() };
+            let engine = PageStorageEngine::new(storage, &file_path, config).await.unwrap();
+            engine.page_manager.insert("test", b"key1", b"val1").await.unwrap();
+            engine.page_manager.insert("test", b"key2", b"val2").await.unwrap();
+            engine.flush().await.unwrap();
+        }
+
+        // 重新打开，验证 next_page_number 已恢复（不会覆盖已有数据）
+        {
+            let storage: Arc<dyn Storage> = Arc::new(WasiStorage::new(dir.path()));
+            let config = BufferPoolConfig { max_pages: 10, ..Default::default() };
+            let engine = PageStorageEngine::new(storage, &file_path, config).await.unwrap();
+            // 插入新记录，不应覆盖旧数据
+            engine.page_manager.insert("test", b"key3", b"val3").await.unwrap();
+            let count = engine.page_manager.count_records("test").await.unwrap();
+            assert_eq!(count, 3);
+            let r1 = engine.page_manager.get("test", b"key1").await.unwrap();
+            assert_eq!(r1.unwrap().value, b"val1");
+            let r3 = engine.page_manager.get("test", b"key3").await.unwrap();
+            assert_eq!(r3.unwrap().value, b"val3");
+        }
     }
 }

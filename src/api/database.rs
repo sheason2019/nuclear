@@ -5,6 +5,7 @@ use async_graphql::{Schema, EmptySubscription};
 use crate::core::{VectorClock, LWWMap};
 use crate::storage::{Storage, error::StorageError, OpenOptions};
 use crate::storage::{PageStorageEngine, BufferPoolConfig};
+use crate::storage::btree::{SharedBTreeIndex, IndexEntry};
 use crate::graphql::{QueryRoot, MutationRoot, EventBus, Event, EventType};
 use crate::sync::{ChangeLog, ChangeEntry, Operation as SyncOperation, SyncMessage};
 use crate::transaction::wal::WriteAheadLog;
@@ -25,10 +26,12 @@ pub struct Database<S: Storage + 'static> {
     pub(crate) wal: Arc<WriteAheadLog>,
     txn_manager: Arc<RwLock<Option<TransactionManager>>>,
     constraint_manager: Arc<RwLock<ConstraintManager>>,
+    cached_schema: Arc<RwLock<Option<Schema<crate::graphql::QueryRoot, crate::graphql::MutationRoot, EmptySubscription>>>>,
 }
 
 pub(crate) struct Collection {
     pub data: LWWMap<String, RecordData>,
+    pub indexes: HashMap<String, SharedBTreeIndex>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -69,6 +72,7 @@ pub(crate) struct GraphqlDatabase {
     pub wal: Arc<WriteAheadLog>,
     pub txn_manager: Arc<RwLock<Option<TransactionManager>>>,
     pub constraint_manager: Arc<RwLock<ConstraintManager>>,
+    page_engine: Option<PageStorageEngine>,
 }
 
 impl GraphqlDatabase {
@@ -163,7 +167,7 @@ impl GraphqlDatabase {
             {
                 let mut collections = self.collections.write().await;
                 let col = collections.entry(collection.to_string())
-                    .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id) });
+                    .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id), indexes: HashMap::new() });
                 col.data.insert(id.clone(), record.clone());
             }
             
@@ -182,13 +186,15 @@ impl GraphqlDatabase {
                 collection: collection.to_string(),
                 record_id: id.clone(),
                 operation: SyncOperation::Create,
-                data: Some(data),
+                data: Some(data.clone()),
                 vector_clock: current_clock,
             });
             drop(changelog);
-            
+
             self.save_collection(collection).await?;
-            
+
+            self.update_indexes_on_insert(collection, &id, &data).await;
+
             let _ = self.event_bus.publish(Event {
                 event_type: EventType::Created,
                 collection: collection.to_string(),
@@ -233,6 +239,7 @@ impl GraphqlDatabase {
                 let id_string = id.to_string();
                 if let Some(mut record) = col.data.get(&id_string).cloned() {
                     let old_record = record.clone();
+                    let old_fields = record.fields.clone();
                     record.fields = data.clone();
                     record.meta.updated_at = now;
                     record.meta.clock = current_clock.clone();
@@ -254,13 +261,15 @@ impl GraphqlDatabase {
                         collection: collection.to_string(),
                         record_id: id.to_string(),
                         operation: SyncOperation::Update,
-                        data: Some(data),
+                        data: Some(data.clone()),
                         vector_clock: current_clock,
                     });
                     drop(changelog);
                     
                     self.save_collection(collection).await?;
-                    
+
+                    self.update_indexes_on_update(collection, id, &old_fields, &data).await;
+
                     let _ = self.event_bus.publish(Event {
                         event_type: EventType::Updated,
                         collection: collection.to_string(),
@@ -298,6 +307,7 @@ impl GraphqlDatabase {
             let mut collections = self.collections.write().await;
             if let Some(col) = collections.get_mut(collection) {
                 let old_record = col.data.get(&id.to_string()).cloned();
+                let old_fields = old_record.as_ref().map(|r| r.fields.clone());
                 col.data.remove(id.to_string());
                 drop(collections);
                 
@@ -329,7 +339,11 @@ impl GraphqlDatabase {
                 drop(changelog);
                 
                 self.save_collection(collection).await?;
-                
+
+                if let Some(fields) = &old_fields {
+                    self.update_indexes_on_delete(collection, id, fields).await;
+                }
+
                 let _ = self.event_bus.publish(Event {
                     event_type: EventType::Deleted,
                     collection: collection.to_string(),
@@ -351,40 +365,231 @@ impl GraphqlDatabase {
     pub async fn count_records(&self, collection: &str) -> Result<i32, StorageError> {
         let collections = self.collections.read().await;
         if let Some(col) = collections.get(collection) {
-            Ok(col.data.keys().count() as i32)
+            Ok(col.data.values().count() as i32)
         } else {
             Ok(0)
         }
     }
-    
-    async fn save_collection(&self, name: &str) -> Result<(), StorageError> {
-        let collections = self.collections.read().await;
-        if let Some(collection) = collections.get(name) {
-            let mut records = Vec::new();
-            for key in collection.data.keys() {
-                if let Some(record) = collection.data.get(key) {
-                    records.push(record.clone());
+
+    pub async fn create_index(&self, collection: &str, field: &str) -> Result<(), StorageError> {
+        let mut collections = self.collections.write().await;
+        let col = collections.entry(collection.to_string())
+            .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id), indexes: HashMap::new() });
+
+        if col.indexes.contains_key(field) {
+            return Ok(()); // Already indexed
+        }
+
+        let index = SharedBTreeIndex::new(
+            self.storage.clone(),
+            &format!("{}/idx_{}.btree", self.base_path, collection),
+        );
+        // Build index from existing records
+        for (key, record) in col.data.iter() {
+            if let Some(value) = record.fields.get(field) {
+                let index_key = format!("{}\x00{}", value, key);
+                index.insert(index_key, IndexEntry::new(0, 0)).await;
+            }
+        }
+        col.indexes.insert(field.to_string(), index);
+        Ok(())
+    }
+
+    pub async fn drop_index(&self, collection: &str, field: &str) -> Result<bool, StorageError> {
+        let mut collections = self.collections.write().await;
+        if let Some(col) = collections.get_mut(collection) {
+            Ok(col.indexes.remove(field).is_some())
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn create_records(&self, collection: &str, items: Vec<serde_json::Value>) -> Result<Vec<RecordData>, StorageError> {
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            let mut txn = tm.begin();
+            let mut results = Vec::new();
+
+            for data in items {
+                let id = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().timestamp_millis() as u64;
+
+                let cm = self.constraint_manager.read().await;
+                cm.apply_defaults(collection, &mut data.clone());
+                cm.validate(collection, &data)?;
+                drop(cm);
+
+                let data_bytes = bincode::serialize(&data)
+                    .map_err(|e| StorageError::WasmError(e.to_string()))?;
+
+                txn.operations.push(TxnOperation::Insert {
+                    collection: collection.to_string(),
+                    key: id.clone(),
+                    data: data_bytes,
+                });
+
+                let mut clock = self.clock.write().await;
+                clock.increment(&self.node_id);
+                let current_clock = clock.clone();
+                drop(clock);
+
+                let record = RecordData {
+                    fields: data.clone(),
+                    meta: RecordMeta {
+                        id: id.clone(),
+                        created_at: now,
+                        updated_at: now,
+                        clock: current_clock.clone(),
+                    },
+                };
+
+                {
+                    let mut collections = self.collections.write().await;
+                    let col = collections.entry(collection.to_string())
+                        .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id), indexes: HashMap::new() });
+                    col.data.insert(id.clone(), record.clone());
+                }
+
+                self.update_indexes_on_insert(collection, &id, &data).await;
+                results.push(record);
+            }
+
+            if let Err(e) = tm.commit(&mut txn).await {
+                // Rollback all inserts
+                let mut collections = self.collections.write().await;
+                if let Some(col) = collections.get_mut(collection) {
+                    for record in &results {
+                        col.data.remove(record.meta.id.clone());
+                    }
+                }
+                return Err(e);
+            }
+
+            self.save_collection(collection).await?;
+            Ok(results)
+        } else {
+            Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
+        }
+    }
+
+    pub async fn delete_records(&self, collection: &str, ids: Vec<String>) -> Result<i32, StorageError> {
+        let mut tm = self.txn_manager.write().await;
+        if let Some(tm) = tm.as_mut() {
+            let mut txn = tm.begin();
+            let mut deleted_count = 0i32;
+            let mut deleted_records = Vec::new();
+
+            for id in &ids {
+                txn.operations.push(TxnOperation::Delete {
+                    collection: collection.to_string(),
+                    key: id.clone(),
+                });
+            }
+
+            let mut collections = self.collections.write().await;
+            if let Some(col) = collections.get_mut(collection) {
+                for id in &ids {
+                    if let Some(old_record) = col.data.get(id).cloned() {
+                        col.data.remove(id.clone());
+                        deleted_records.push((id.clone(), old_record));
+                        deleted_count += 1;
+                    }
                 }
             }
-            
-            let json = serde_json::to_vec(&records)
-                .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
-            
-            let path = format!("{}.json", name);
-            
-            let _ = tokio::fs::create_dir_all(&self.base_path).await;
-            
-            let options = OpenOptions {
-                read: false,
-                write: true,
-                create: true,
-                truncate: true,
-            };
-            
-            let handle = self.storage.open(&path, options).await?;
-            self.storage.write(handle, 0, &json).await?;
-            self.storage.sync(handle).await?;
-            self.storage.close(handle).await?;
+            drop(collections);
+
+            if let Err(e) = tm.commit(&mut txn).await {
+                let mut collections = self.collections.write().await;
+                if let Some(col) = collections.get_mut(collection) {
+                    for (id, record) in deleted_records {
+                        col.data.insert(id, record);
+                    }
+                }
+                return Err(e);
+            }
+
+            let mut clock = self.clock.write().await;
+            clock.increment(&self.node_id);
+            drop(clock);
+
+            for (id, record) in &deleted_records {
+                self.update_indexes_on_delete(collection, id, &record.fields).await;
+            }
+
+            self.save_collection(collection).await?;
+            Ok(deleted_count)
+        } else {
+            Err(StorageError::WasmError("Transaction manager not initialized".to_string()))
+        }
+    }
+
+    /// Check if a field has an index and return candidate record IDs
+    async fn query_index(&self, collection: &str, field: &str) -> Option<Vec<String>> {
+        let collections = self.collections.read().await;
+        let col = collections.get(collection)?;
+        let _index = col.indexes.get(field)?;
+        // For now, return None to indicate index exists but we fall through to full scan.
+        // Full index-based filtering would need operator-aware range scans.
+        None
+    }
+
+    async fn update_indexes_on_insert(&self, collection: &str, id: &str, fields: &serde_json::Value) {
+        let collections = self.collections.read().await;
+        if let Some(col) = collections.get(collection) {
+            for (field, index) in &col.indexes {
+                if let Some(value) = fields.get(field) {
+                    let index_key = format!("{}\x00{}", value, id);
+                    index.insert(index_key, IndexEntry::new(0, 0)).await;
+                }
+            }
+        }
+    }
+
+    async fn update_indexes_on_delete(&self, collection: &str, id: &str, fields: &serde_json::Value) {
+        let collections = self.collections.read().await;
+        if let Some(col) = collections.get(collection) {
+            for (field, index) in &col.indexes {
+                if let Some(value) = fields.get(field) {
+                    let index_key = format!("{}\x00{}", value, id);
+                    index.remove(&index_key).await;
+                }
+            }
+        }
+    }
+
+    async fn update_indexes_on_update(&self, collection: &str, id: &str, old_fields: &serde_json::Value, new_fields: &serde_json::Value) {
+        let collections = self.collections.read().await;
+        if let Some(col) = collections.get(collection) {
+            for (field, index) in &col.indexes {
+                let old_val = old_fields.get(field);
+                let new_val = new_fields.get(field);
+                if old_val != new_val {
+                    if let Some(v) = old_val {
+                        let index_key = format!("{}\x00{}", v, id);
+                        index.remove(&index_key).await;
+                    }
+                    if let Some(v) = new_val {
+                        let index_key = format!("{}\x00{}", v, id);
+                        index.insert(index_key, IndexEntry::new(0, 0)).await;
+                    }
+                }
+            }
+        }
+    }
+    
+    async fn save_collection(&self, name: &str) -> Result<(), StorageError> {
+        if let Some(engine) = &self.page_engine {
+            let collections = self.collections.read().await;
+            if let Some(collection) = collections.get(name) {
+                engine.page_manager.initialize_collection(name).await?;
+                for key in collection.data.keys() {
+                    if let Some(record) = collection.data.get(key) {
+                        let value = bincode::serialize(record)
+                            .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
+                        engine.page_manager.insert(name, key.as_bytes(), &value).await?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -404,8 +609,11 @@ impl<S: Storage + 'static> Database<S> {
             BufferPoolConfig::default(),
         ).await?;
         
-        let txn_manager = TransactionManager::new((*wal_arc).clone()).await?;
-        
+        let mut txn_manager = TransactionManager::new((*wal_arc).clone()).await?;
+
+        // Get committed WAL entries for replay (before wrapping in Arc)
+        let wal_entries = txn_manager.get_committed_entries().await?;
+
         let mut db = Self {
             storage: storage_arc,
             page_engine: Some(page_engine),
@@ -419,21 +627,25 @@ impl<S: Storage + 'static> Database<S> {
             wal: wal_arc,
             txn_manager: Arc::new(RwLock::new(Some(txn_manager))),
             constraint_manager: Arc::new(RwLock::new(ConstraintManager::new())),
+            cached_schema: Arc::new(RwLock::new(None)),
         };
-        
+
         db.load_all().await?;
-        
+
+        // Replay committed WAL entries on top of page data
+        if !wal_entries.is_empty() {
+            db.replay_wal_entries(&wal_entries).await?;
+            // Checkpoint: flush page engine and truncate WAL
+            db.checkpoint().await?;
+        }
+
         Ok(db)
     }
 
     pub async fn query(&self, query: &str) -> Result<serde_json::Value, StorageError> {
-        let db_clone = self.clone_for_graphql();
-        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
-            .data(db_clone)
-            .finish();
-        
+        let schema = self.get_or_build_schema().await;
         let result = schema.execute(query).await;
-        
+
         if result.is_err() {
             return Err(StorageError::WasmError(
                 result.errors.iter()
@@ -442,19 +654,15 @@ impl<S: Storage + 'static> Database<S> {
                     .join(", ")
             ));
         }
-        
+
         serde_json::to_value(&result.data)
             .map_err(|e| StorageError::WasmError(e.to_string()))
     }
 
     pub async fn mutation(&self, mutation: &str) -> Result<serde_json::Value, StorageError> {
-        let db_clone = self.clone_for_graphql();
-        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
-            .data(db_clone)
-            .finish();
-        
+        let schema = self.get_or_build_schema().await;
         let result = schema.execute(mutation).await;
-        
+
         if result.is_err() {
             return Err(StorageError::WasmError(
                 result.errors.iter()
@@ -463,9 +671,25 @@ impl<S: Storage + 'static> Database<S> {
                     .join(", ")
             ));
         }
-        
+
         serde_json::to_value(&result.data)
             .map_err(|e| StorageError::WasmError(e.to_string()))
+    }
+
+    async fn get_or_build_schema(&self) -> Schema<crate::graphql::QueryRoot, crate::graphql::MutationRoot, EmptySubscription> {
+        {
+            let cached = self.cached_schema.read().await;
+            if let Some(schema) = cached.as_ref() {
+                return schema.clone();
+            }
+        }
+        let db_clone = self.clone_for_graphql();
+        let schema = Schema::build(crate::graphql::QueryRoot, crate::graphql::MutationRoot, EmptySubscription)
+            .data(db_clone)
+            .finish();
+        let mut cached = self.cached_schema.write().await;
+        *cached = Some(schema.clone());
+        schema
     }
 
     fn clone_for_graphql(&self) -> GraphqlDatabase {
@@ -480,6 +704,7 @@ impl<S: Storage + 'static> Database<S> {
             wal: self.wal.clone(),
             txn_manager: self.txn_manager.clone(),
             constraint_manager: self.constraint_manager.clone(),
+            page_engine: self.page_engine.clone(),
         }
     }
 
@@ -572,60 +797,99 @@ impl<S: Storage + 'static> Database<S> {
         Ok(())
     }
     
-    async fn save_collection(&self, name: &str, collection: &Collection) -> Result<(), StorageError> {
-        if let Some(engine) = &self.page_engine {
-            engine.page_manager.initialize_collection(name).await?;
-            for key in collection.data.keys() {
-                if let Some(record) = collection.data.get(key) {
-                    let value = bincode::serialize(record)
-                        .map_err(|e| StorageError::WasmError(format!("Serialization error: {}", e)))?;
-                    engine.page_manager.insert(name, key.as_bytes(), &value).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-    
     async fn load_all(&mut self) -> Result<(), StorageError> {
         let mut collections = self.collections.write().await;
         collections.clear();
-        Ok(())
-    }
-    
-    pub async fn load_collection(&self, name: &str) -> Result<(), StorageError> {
-        let path = format!("{}.bin", name);
-        let options = OpenOptions {
-            read: true,
-            write: false,
-            create: false,
-            truncate: false,
-        };
-        
-        let handle = match self.storage.open(&path, options).await {
-            Ok(h) => h,
-            Err(_) => return Ok(()),
-        };
-        
-        let size = self.storage.size(handle).await? as usize;
-        let mut buf = vec![0u8; size];
-        self.storage.read(handle, 0, &mut buf).await?;
-        self.storage.close(handle).await?;
-        
-        let records: Vec<RecordData> = bincode::deserialize(&buf)
-            .map_err(|e| StorageError::WasmError(format!("Deserialization error: {}", e)))?;
-        
-        let mut collections = self.collections.write().await;
-        let mut lww_map = LWWMap::new(&self.node_id);
-        
-        for record in records {
-            lww_map.insert(record.meta.id.clone(), record);
+
+        if let Some(engine) = &self.page_engine {
+            let names = engine.page_manager.collection_names().await;
+            for name in names {
+                let records = engine.page_manager.scan_collection(&name).await?;
+                let mut lww_map = LWWMap::new(&self.node_id);
+
+                for record in records {
+                    if record.deleted {
+                        continue;
+                    }
+                    match bincode::deserialize::<RecordData>(&record.value) {
+                        Ok(data) => {
+                            let key = String::from_utf8_lossy(&record.key).to_string();
+                            let ts = data.meta.updated_at;
+                            lww_map.insert_with_timestamp(
+                                key,
+                                data,
+                                ts,
+                                &self.node_id,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to deserialize record in collection '{}': {}", name, e);
+                        }
+                    }
+                }
+
+                collections.insert(name, Collection { data: lww_map, indexes: HashMap::new() });
+            }
         }
-        
-        collections.insert(name.to_string(), Collection { data: lww_map });
-        
+
         Ok(())
     }
-    
+
+    async fn replay_wal_entries(&mut self, entries: &[crate::transaction::wal::WalEntry]) -> Result<(), StorageError> {
+        use crate::transaction::wal::WalEntry;
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+
+        for entry in entries {
+            match entry {
+                WalEntry::Insert { collection, key, data, .. } => {
+                    let fields: serde_json::Value = bincode::deserialize(data)
+                        .map_err(|e| StorageError::WasmError(format!("WAL replay deserialize: {}", e)))?;
+                    let record = RecordData {
+                        fields,
+                        meta: RecordMeta {
+                            id: key.clone(),
+                            created_at: now,
+                            updated_at: now,
+                            clock: self.clock.read().await.clone(),
+                        },
+                    };
+                    let mut collections = self.collections.write().await;
+                    let col = collections.entry(collection.clone())
+                        .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id), indexes: HashMap::new() });
+                    col.data.insert(key.clone(), record);
+                }
+                WalEntry::Update { collection, key, data, .. } => {
+                    let fields: serde_json::Value = bincode::deserialize(data)
+                        .map_err(|e| StorageError::WasmError(format!("WAL replay deserialize: {}", e)))?;
+                    let mut collections = self.collections.write().await;
+                    if let Some(col) = collections.get_mut(collection) {
+                        if let Some(mut record) = col.data.get(key).cloned() {
+                            record.fields = fields;
+                            record.meta.updated_at = now;
+                            record.meta.clock = self.clock.read().await.clone();
+                            col.data.insert(key.clone(), record);
+                        }
+                    }
+                }
+                WalEntry::Delete { collection, key, .. } => {
+                    let mut collections = self.collections.write().await;
+                    if let Some(col) = collections.get_mut(collection) {
+                        col.data.remove(key.clone());
+                    }
+                }
+                _ => {} // Begin, Commit, Rollback — no action
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn checkpoint(&self) -> Result<(), StorageError> {
+        self.save().await?;
+        self.wal.truncate().await?;
+        Ok(())
+    }
+
     pub async fn get_sync_request(&self) -> SyncMessage {
         let clock = self.clock.read().await;
         SyncMessage::SyncRequest {
@@ -671,7 +935,7 @@ impl<S: Storage + 'static> Database<S> {
                 if let Some(data) = change.data {
                     let mut collections = self.collections.write().await;
                     let col = collections.entry(change.collection.clone())
-                        .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id) });
+                        .or_insert_with(|| Collection { data: LWWMap::new(&self.node_id), indexes: HashMap::new() });
                     
                     let now = chrono::Utc::now().timestamp_millis() as u64;
                     
