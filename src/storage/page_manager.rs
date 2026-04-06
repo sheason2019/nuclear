@@ -228,6 +228,36 @@ impl PageManager {
         self.buffer_pool.flush().await
     }
 
+    /// Compact a collection by removing deleted records from all its pages.
+    /// Returns the number of pages compacted.
+    pub async fn compact_collection(&self, collection: &str) -> Result<usize, StorageError> {
+        let pages_to_compact: Vec<PageNumber> = {
+            if let Some(pages) = self.collection_pages.get(collection) {
+                let mut result = Vec::new();
+                for &page_number in pages {
+                    let page = self.buffer_pool.get_page(page_number).await?;
+                    if page.deleted_count() > 0 {
+                        result.push(page_number);
+                    }
+                }
+                result
+            } else {
+                return Ok(0);
+            }
+        };
+
+        let mut compacted = 0;
+        for page_number in &pages_to_compact {
+            let page = self.buffer_pool.get_page(*page_number).await?;
+            if let Some(new_page) = page.compact() {
+                self.buffer_pool.write_page(new_page).await?;
+                compacted += 1;
+            }
+        }
+
+        Ok(compacted)
+    }
+
     async fn find_record(&self, collection: &str, key: &[u8]) -> Result<Option<RecordLocation>, StorageError> {
         if let Some(pages) = self.collection_pages.get(collection) {
             for &page_number in pages {
@@ -313,6 +343,10 @@ impl SharedPageManager {
 
     pub async fn count_records(&self, collection: &str) -> Result<usize, StorageError> {
         self.inner.read().await.count_records(collection).await
+    }
+
+    pub async fn compact_collection(&self, collection: &str) -> Result<usize, StorageError> {
+        self.inner.read().await.compact_collection(collection).await
     }
 
     pub async fn flush(&self) -> Result<(), StorageError> {

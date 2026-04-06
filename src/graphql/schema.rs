@@ -251,6 +251,17 @@ impl MutationRoot {
             .map_err(|e| Error::new(e.to_string()))
     }
 
+    async fn compact_collection(
+        &self,
+        ctx: &Context<'_>,
+        collection: String,
+    ) -> Result<i32> {
+        let db = ctx.data::<GraphqlDatabase>()?;
+        let count = db.compact_collection(&collection).await
+            .map_err(|e| Error::new(e.to_string()))?;
+        Ok(count as i32)
+    }
+
     async fn create_records(
         &self,
         ctx: &Context<'_>,

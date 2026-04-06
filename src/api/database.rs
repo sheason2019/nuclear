@@ -600,6 +600,15 @@ impl GraphqlDatabase {
         }
     }
 
+    /// Compact a collection by removing dead records from pages.
+    pub async fn compact_collection(&self, collection: &str) -> Result<usize, StorageError> {
+        if let Some(engine) = &self.page_engine {
+            engine.page_manager.compact_collection(collection).await
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Check if a field has an index and return candidate record IDs
     async fn query_index(&self, collection: &str, field: &str) -> Option<Vec<String>> {
         let collections = self.collections.read().await;

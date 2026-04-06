@@ -436,6 +436,38 @@ impl Page {
     pub fn iter_cells(&self) -> impl Iterator<Item = u16> {
         0..self.header.record_count
     }
+
+    /// Count deleted records in this page.
+    pub fn deleted_count(&self) -> u16 {
+        let mut count = 0u16;
+        for i in 0..self.header.record_count {
+            if let Ok((_, _, deleted)) = self.read_record_by_index(i) {
+                if deleted {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Compact the page by removing deleted records.
+    /// Returns a new page with only live records, or None if no compaction needed.
+    pub fn compact(&self) -> Option<Self> {
+        let deleted = self.deleted_count();
+        if deleted == 0 {
+            return None;
+        }
+
+        let mut new_page = Page::new(self.page_number, self.header.page_type);
+        for i in 0..self.header.record_count {
+            if let Ok((key, value, deleted)) = self.read_record_by_index(i) {
+                if !deleted {
+                    new_page.write_record(&key, &value).ok();
+                }
+            }
+        }
+        Some(new_page)
+    }
 }
 
 /// 页面迭代器
@@ -702,5 +734,34 @@ mod tests {
         // Fresh pages have all-zero checksum, verification is skipped
         let bytes = page.to_bytes();
         assert!(Page::from_bytes(1, &bytes).is_ok());
+    }
+
+    #[test]
+    fn test_page_compact_removes_deleted() {
+        let mut page = Page::new(1, PageType::Data);
+        page.write_record(b"key1", b"value1").unwrap();
+        page.write_record(b"key2", b"value2").unwrap();
+        page.write_record(b"key3", b"value3").unwrap();
+
+        page.delete_record_by_index(1).unwrap();
+        assert_eq!(page.deleted_count(), 1);
+
+        let compacted = page.compact().unwrap();
+        assert_eq!(compacted.header.record_count, 2);
+        assert_eq!(compacted.deleted_count(), 0);
+
+        let (k1, v1, d1) = compacted.read_record_by_index(0).unwrap();
+        assert_eq!(k1, b"key1");
+        assert!(!d1);
+        let (k2, v2, d2) = compacted.read_record_by_index(1).unwrap();
+        assert_eq!(k2, b"key3");
+        assert!(!d2);
+    }
+
+    #[test]
+    fn test_page_compact_none_when_no_deletes() {
+        let mut page = Page::new(1, PageType::Data);
+        page.write_record(b"key1", b"value1").unwrap();
+        assert!(page.compact().is_none());
     }
 }
